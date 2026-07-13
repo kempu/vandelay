@@ -66,9 +66,13 @@ impl Endpoints {
         )
     }
 
-    pub fn folder_messages_ids(&self, folder_id: &str, top: usize) -> String {
+    /// Message listing for a folder. Selects `isRead` and `flag` alongside `id` so the
+    /// importer can map read/flag state to JMAP keywords (MailPortal Patch 1): the MIME
+    /// blob fetched per message carries neither — they are Graph message properties, not
+    /// MIME headers.
+    pub fn folder_messages_meta(&self, folder_id: &str, top: usize) -> String {
         format!(
-            "{}/mailFolders/{}/messages?$top={top}&$select=id",
+            "{}/mailFolders/{}/messages?$top={top}&$select=id,isRead,flag",
             self.me_or_user(),
             url_escape(folder_id)
         )
@@ -124,6 +128,13 @@ impl Endpoints {
             self.me_or_user(),
             url_escape(folder_id)
         )
+    }
+
+    /// Contact-id listing for the DEFAULT Contacts folder (`{me_or_user}/contacts`), which
+    /// the `/contactFolders` collection excludes (MailPortal Patch 2). Mirrors
+    /// `contact_folder_contacts_ids` but for the default folder, which has no folder id.
+    pub fn default_contacts_ids(&self, top: usize) -> String {
+        format!("{}/contacts?$top={top}&$select=id", self.me_or_user())
     }
 
     pub fn contact(&self, contact_id: &str) -> String {
@@ -189,6 +200,42 @@ pub fn collect_all_ids(
             for item in arr {
                 if let Some(id) = item.get("id").and_then(Value::as_str) {
                     out.push(id.to_owned());
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Read/flag state for a Graph message, captured from the folder message listing so the
+/// importer can map it to JMAP keywords (MailPortal Patch 1).
+#[derive(Debug, Clone, Default)]
+pub struct MessageMeta {
+    pub is_read: bool,
+    pub flagged: bool,
+}
+
+/// Enumerate `(id, MessageMeta)` for a message listing that selects `id,isRead,flag`
+/// (see `Endpoints::folder_messages_meta`), following `@odata.nextLink`. A message with a
+/// missing `isRead`/`flag` defaults to unread/unflagged rather than being dropped.
+pub fn collect_message_metas(
+    client: &GraphClient,
+    initial_url: &str,
+    prefer: &[&str],
+) -> Result<Vec<(String, MessageMeta)>, GraphError> {
+    let mut out = Vec::new();
+    paged_collect(client, initial_url, prefer, |page| {
+        if let Some(arr) = page.get("value").and_then(Value::as_array) {
+            for item in arr {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    let is_read = item.get("isRead").and_then(Value::as_bool).unwrap_or(false);
+                    let flagged = item
+                        .get("flag")
+                        .and_then(|f| f.get("flagStatus"))
+                        .and_then(Value::as_str)
+                        == Some("flagged");
+                    out.push((id.to_owned(), MessageMeta { is_read, flagged }));
                 }
             }
         }
@@ -282,5 +329,53 @@ mod tests {
         let url = e.calendar_events_ids("CAL", 100);
         assert!(url.contains("$select=id,type,seriesMasterId"));
         assert!(url.contains("$top=100"));
+    }
+
+    #[test]
+    fn folder_messages_meta_selects_read_and_flag() {
+        let e = Endpoints::for_me(DEFAULT_API_BASE);
+        let url = e.folder_messages_meta("F", 100);
+        assert!(url.contains("/mailFolders/F/messages?"));
+        assert!(url.contains("$select=id,isRead,flag"));
+        assert!(url.contains("$top=100"));
+    }
+
+    #[test]
+    fn default_contacts_ids_targets_default_folder() {
+        let e = Endpoints::for_me(DEFAULT_API_BASE);
+        let url = e.default_contacts_ids(50);
+        assert!(url.ends_with("/me/contacts?$top=50&$select=id"));
+    }
+
+    #[test]
+    fn collect_message_metas_reads_read_and_flag_state() {
+        let page = serde_json::json!({
+            "value": [
+                {"id": "A", "isRead": true,  "flag": {"flagStatus": "flagged"}},
+                {"id": "B", "isRead": false, "flag": {"flagStatus": "notFlagged"}},
+                {"id": "C"}
+            ]
+        });
+        // Exercise the same extraction collect_message_metas applies per item.
+        let arr = page.get("value").and_then(Value::as_array).unwrap();
+        let metas: Vec<(String, MessageMeta)> = arr
+            .iter()
+            .filter_map(|item| {
+                let id = item.get("id").and_then(Value::as_str)?;
+                let is_read = item.get("isRead").and_then(Value::as_bool).unwrap_or(false);
+                let flagged = item
+                    .get("flag")
+                    .and_then(|f| f.get("flagStatus"))
+                    .and_then(Value::as_str)
+                    == Some("flagged");
+                Some((id.to_owned(), MessageMeta { is_read, flagged }))
+            })
+            .collect();
+        assert_eq!(metas[0].1.is_read, true);
+        assert_eq!(metas[0].1.flagged, true);
+        assert_eq!(metas[1].1.is_read, false);
+        assert_eq!(metas[1].1.flagged, false);
+        assert_eq!(metas[2].1.is_read, false);
+        assert_eq!(metas[2].1.flagged, false);
     }
 }

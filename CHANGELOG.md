@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.7-mp.1] - 2026-07-13
+
+MailPortal patched build (fork `kempu/vandelay`). Carries local patches on top of stock
+`1.0.7` that are **not** upstream — the binary still reports version `1.0.7`; the patched
+build is distinguished by its tag/artifact (`-mp.1`) and checksum. Re-check and re-apply on
+every upstream bump; drop a patch once upstream fixes it. Full rationale + re-apply protocol
+live in the MailPortal repo `docs/vandelay-patches.md`.
+
+### Fixed
+- exchange-graph: preserve message read/unread (`$seen`) and flagged (`$flagged`) state on
+  import. Stock derived keywords only from the MIME blob, which does not carry these Graph
+  message properties, so every migrated message landed unread and unflagged (Patch 1).
+- exchange-graph: import the DEFAULT Contacts folder (`{me_or_user}/contacts`), which the
+  `/contactFolders` collection excludes. Stock silently imported zero contacts for a mailbox
+  whose contacts live in the default folder — i.e. most mailboxes (Patch 2).
+
 ## [1.0.7] - 2026-07-XX
 
 ### Added

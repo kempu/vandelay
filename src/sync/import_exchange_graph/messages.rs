@@ -34,8 +34,8 @@ pub fn reconcile_all(
     let mut any_failure = false;
 
     for folder in folders {
-        let url = ctx.endpoints.folder_messages_ids(&folder.graph_id, ctx.top);
-        let ids = match api::collect_all_ids(ctx.client, &url, &[]) {
+        let url = ctx.endpoints.folder_messages_meta(&folder.graph_id, ctx.top);
+        let metas = match api::collect_message_metas(ctx.client, &url, &[]) {
             Ok(v) => v,
             Err(e) => {
                 ctx.logger.warn(&format!(
@@ -51,20 +51,25 @@ pub fn reconcile_all(
             eprintln!(
                 "graph folder {} enumerated {} messages",
                 folder.graph_id,
-                ids.len()
+                metas.len()
             );
         }
-        for id in &ids {
+        // Keep each message's read/flag state so apply_message_in_tx can map it to JMAP
+        // keywords (Patch 1); the per-message MIME fetch below carries neither property.
+        let meta_by_id: std::collections::HashMap<String, api::MessageMeta> =
+            metas.iter().cloned().collect();
+        for (id, _) in &metas {
             server_total.insert(id.clone());
         }
-        let new_ids: Vec<String> = ids
+        let new_ids: Vec<String> = metas
             .into_iter()
+            .map(|(id, _)| id)
             .filter(|id| !local.contains_key(id) && planned.insert(id.clone()))
             .collect();
         if new_ids.is_empty() {
             continue;
         }
-        fetch_and_insert(conn, ctx, folder, &new_ids, counts)?;
+        fetch_and_insert(conn, ctx, folder, &new_ids, &meta_by_id, counts)?;
     }
 
     if any_failure {
@@ -83,6 +88,7 @@ fn fetch_and_insert(
     ctx: &GraphCoordinator<'_>,
     folder: &MailFolder,
     ids: &[String],
+    metas: &std::collections::HashMap<String, api::MessageMeta>,
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
     let client = ctx.client.clone();
@@ -110,7 +116,15 @@ fn fetch_and_insert(
                     tx_opt = Some(conn.unchecked_transaction()?);
                 }
                 let tx = tx_opt.as_mut().expect("tx is Some");
-                apply_message_in_tx(tx, ctx, folder, &graph_id, &bytes, counts)?;
+                apply_message_in_tx(
+                    tx,
+                    ctx,
+                    folder,
+                    &graph_id,
+                    &bytes,
+                    metas.get(&graph_id),
+                    counts,
+                )?;
                 in_batch += 1;
                 if in_batch >= CHUNK_SIZE {
                     if let Some(t) = tx_opt.take() {
@@ -141,13 +155,14 @@ fn apply_message_in_tx(
     folder: &MailFolder,
     graph_id: &str,
     bytes: &[u8],
+    meta: Option<&api::MessageMeta>,
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
     let (idx, date_header) = email_meta_from_blob(bytes);
     let message_match = index_to_json(&idx);
     let received_at = date_header.unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned());
     let mailbox_ids = json!([folder.local_id]).to_string();
-    let keywords = "[]".to_owned();
+    let keywords = keywords_json(meta);
 
     let blob_id = blobs::intern_blob(tx, bytes)?;
     tx.execute(
@@ -165,6 +180,23 @@ fn apply_message_in_tx(
     )?;
     counts.created += 1;
     Ok(())
+}
+
+/// Build the JMAP keywords JSON array for a message from its Graph read/flag state
+/// (Patch 1). Read maps to `$seen`, flagged to `$flagged`; a message with no captured meta
+/// stays `[]` (unread/unflagged), matching stock behaviour. The column holds a JSON array
+/// of keyword strings, the same shape the maildir/takeout importers write.
+fn keywords_json(meta: Option<&api::MessageMeta>) -> String {
+    let mut kw: Vec<&str> = Vec::new();
+    if let Some(m) = meta {
+        if m.is_read {
+            kw.push("$seen");
+        }
+        if m.flagged {
+            kw.push("$flagged");
+        }
+    }
+    serde_json::to_string(&kw).unwrap_or_else(|_| "[]".to_owned())
 }
 
 fn delete_vanished(
@@ -200,4 +232,43 @@ fn delete_vanished(
         tx.commit()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keywords_json;
+    use crate::exchange_graph::api::MessageMeta;
+
+    #[test]
+    fn keywords_json_maps_read_and_flag() {
+        assert_eq!(keywords_json(None), "[]");
+        assert_eq!(
+            keywords_json(Some(&MessageMeta {
+                is_read: false,
+                flagged: false
+            })),
+            "[]"
+        );
+        assert_eq!(
+            keywords_json(Some(&MessageMeta {
+                is_read: true,
+                flagged: false
+            })),
+            r#"["$seen"]"#
+        );
+        assert_eq!(
+            keywords_json(Some(&MessageMeta {
+                is_read: false,
+                flagged: true
+            })),
+            r#"["$flagged"]"#
+        );
+        assert_eq!(
+            keywords_json(Some(&MessageMeta {
+                is_read: true,
+                flagged: true
+            })),
+            r#"["$seen","$flagged"]"#
+        );
+    }
 }
