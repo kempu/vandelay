@@ -34,9 +34,14 @@ pub fn reconcile_all(
     let mut any_failure = false;
 
     for book in books {
-        let url = ctx
-            .endpoints
-            .contact_folder_contacts_ids(&book.graph_id, ctx.top);
+        // The default Contacts folder has no folder id: list it via {me_or_user}/contacts
+        // (Patch 2). Every other book is a real /contactFolders entry.
+        let url = if book.is_default {
+            ctx.endpoints.default_contacts_ids(ctx.top)
+        } else {
+            ctx.endpoints
+                .contact_folder_contacts_ids(&book.graph_id, ctx.top)
+        };
         let ids = match api::collect_all_ids(ctx.client, &url, &[]) {
             Ok(v) => v,
             Err(e) => {

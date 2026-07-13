@@ -38,7 +38,16 @@ pub struct CalendarFolder {
 pub struct ContactFolder {
     pub graph_id: String,
     pub local_id: i64,
+    /// True for the synthetic default Contacts folder, whose contacts are listed via
+    /// `{me_or_user}/contacts` rather than `/contactFolders/{id}/contacts` (Patch 2).
+    pub is_default: bool,
 }
+
+/// Synthetic graph id for the DEFAULT Contacts folder (`{me_or_user}/contacts`), which the
+/// `/contactFolders` collection Graph returns excludes. Stable so re-runs update rather
+/// than duplicate the address book, and never collides with a real (long, base64url) Graph
+/// folder id (Patch 2).
+pub const DEFAULT_CONTACTS_GRAPH_ID: &str = "mp-default-contacts";
 
 pub fn reconcile_mail(
     conn: &mut Connection,
@@ -256,6 +265,15 @@ pub fn reconcile_address_books(
         server.extend(children);
     }
 
+    // Graph's /contactFolders collection excludes the default Contacts folder, so add it as
+    // a synthetic address book (Patch 2). Its contacts are listed via {me_or_user}/contacts
+    // in contacts::reconcile_all when book.is_default. Keyed by a stable synthetic id so the
+    // id-map updates it on re-run instead of duplicating it.
+    server.push(serde_json::json!({
+        "id": DEFAULT_CONTACTS_GRAPH_ID,
+        "displayName": "Contacts",
+    }));
+
     let local: HashMap<String, i64> =
         exchange_graph_ids::ids_of_type(conn, ctx.source_id, exchange_graph_ids::ADDRESS_BOOK)?;
     let mut out: Vec<ContactFolder> = Vec::new();
@@ -300,6 +318,7 @@ pub fn reconcile_address_books(
             out.push(ContactFolder {
                 graph_id: graph_id.to_owned(),
                 local_id,
+                is_default: graph_id == DEFAULT_CONTACTS_GRAPH_ID,
             });
         }
         tx.commit()?;
