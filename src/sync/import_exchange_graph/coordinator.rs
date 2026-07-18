@@ -27,6 +27,15 @@ pub enum GraphAuth {
     PreAcquired {
         token: String,
     },
+    /// A pre-acquired token backed by a FILE that is re-read while the import runs.
+    /// `token` seeds the initial bearer; `refresh_file` is polled so a token the
+    /// caller rotates mid-import (an app-only token outlives by minutes, but a large
+    /// mailbox outlives IT) is picked up before the old one 401s. This is the
+    /// app-only analogue of the device-code refresher — the caller owns rotation.
+    PreAcquiredFile {
+        token: String,
+        refresh_file: std::path::PathBuf,
+    },
     DeviceCode {
         authority: String,
         client_id: String,
@@ -115,13 +124,24 @@ pub fn run(common: CommonConfig, config: GraphImportConfig) -> Result<Summary, E
         &principal.user_principal_name,
     )?;
 
-    let _refresher = spawn_token_refresher(
-        &client,
-        &config.auth,
-        &acquired,
-        common.allow_invalid_certs,
-        logger,
-    );
+    // Keep the bearer fresh for the whole (possibly hours-long) import. Device-code
+    // runs refresh via their refresh_token; a file-backed pre-acquired token re-reads
+    // the file the caller rotates. A plain pre-acquired token has no refresh path.
+    let _refresher = match &config.auth {
+        GraphAuth::PreAcquiredFile { refresh_file, .. } => spawn_file_token_refresher(
+            &client,
+            refresh_file.clone(),
+            acquired.access_token.clone(),
+            logger,
+        ),
+        _ => spawn_token_refresher(
+            &client,
+            &config.auth,
+            &acquired,
+            common.allow_invalid_certs,
+            logger,
+        ),
+    };
 
     let mut summary = Summary::default();
     let mut mailbox_counts = TypeCounts::default();
@@ -288,9 +308,11 @@ pub fn enumerate_mail_folders(
 
 fn acquire_with_flow(auth: &GraphAuth, allow_invalid_certs: bool) -> Result<AcquiredToken, Error> {
     let flow = match auth {
-        GraphAuth::PreAcquired { token } => OAuthFlow::PreAcquired {
-            token: token.clone(),
-        },
+        GraphAuth::PreAcquired { token } | GraphAuth::PreAcquiredFile { token, .. } => {
+            OAuthFlow::PreAcquired {
+                token: token.clone(),
+            }
+        }
         GraphAuth::DeviceCode {
             authority,
             client_id,
@@ -370,7 +392,9 @@ fn resolve_principal(
 fn canonical_session_url(config: &GraphImportConfig) -> String {
     let authority = match &config.auth {
         GraphAuth::DeviceCode { authority, .. } => authority.clone(),
-        GraphAuth::PreAcquired { .. } => default_authority("common"),
+        GraphAuth::PreAcquired { .. } | GraphAuth::PreAcquiredFile { .. } => {
+            default_authority("common")
+        }
     };
     format!(
         "{}|{}",
@@ -391,7 +415,9 @@ fn spawn_token_refresher(
             authority,
             client_id,
         } => (authority.clone(), client_id.clone()),
-        GraphAuth::PreAcquired { .. } => return None,
+        // A plain pre-acquired token cannot self-refresh; a file-backed one is handled
+        // by spawn_file_token_refresher and never reaches here.
+        GraphAuth::PreAcquired { .. } | GraphAuth::PreAcquiredFile { .. } => return None,
     };
     let refresh = initial.refresh_token.clone()?;
     let mut deadline_unix = initial_deadline_unix(initial)?;
@@ -444,6 +470,69 @@ fn spawn_token_refresher(
                             "graph token refresh failed: {e}; sleeping 60s before retry"
                         ));
                         std::thread::sleep(std::time::Duration::from_secs(60));
+                    }
+                }
+            }
+        })
+        .ok()?;
+    Some(TokenRefresher {
+        shutdown,
+        handle: Some(handle),
+    })
+}
+
+/// Keep the Graph bearer fresh from a token FILE the caller rotates (the app-only
+/// `--access-token-file` flow). Polls the file on a short interval and swaps the
+/// client's bearer via `set_bearer` whenever the file's token changes, so an import
+/// that outlives a single token's lifetime picks up the caller's rotated token before
+/// the old one is rejected. The initial token is already applied, so `current` is
+/// seeded with it to avoid a redundant first swap. Shutdown-aware via the returned
+/// guard's Drop, exactly like the device-code refresher.
+fn spawn_file_token_refresher(
+    client: &GraphClient,
+    path: std::path::PathBuf,
+    initial: String,
+    logger: crate::logging::Logger,
+) -> Option<TokenRefresher> {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    const SHUTDOWN_CHUNK: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let client = client.clone();
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_signal = shutdown.clone();
+    let handle = std::thread::Builder::new()
+        .name("vandelay-graph-token-file-refresh".to_owned())
+        .spawn(move || {
+            let mut current = initial;
+            while !shutdown_signal.load(std::sync::atomic::Ordering::Relaxed) {
+                // Sleep the poll interval in small chunks so a shutdown is prompt.
+                let mut left = POLL_INTERVAL;
+                while left > std::time::Duration::ZERO
+                    && !shutdown_signal.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let step = SHUTDOWN_CHUNK.min(left);
+                    std::thread::sleep(step);
+                    left = left.saturating_sub(step);
+                }
+                if shutdown_signal.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                match crate::exchange_graph::oauth::read_token_file(&path) {
+                    Ok(tok) if tok != current => {
+                        client.set_bearer(tok.clone());
+                        current = tok;
+                        if logger.enabled(crate::logging::LEVEL_PROGRESS) {
+                            eprintln!("graph bearer refreshed from token file");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        // A transient read failure must not kill the import: keep the
+                        // current (still-valid) bearer and try again next tick.
+                        logger.warn(&format!(
+                            "graph token file {} unreadable: {e}; keeping current bearer",
+                            path.display()
+                        ));
                     }
                 }
             }

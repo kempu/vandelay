@@ -1131,6 +1131,13 @@ pub struct ExchangeGraphImportArgs {
 
     #[arg(
         long,
+        value_name = "PATH",
+        help = "File holding the bearer token, re-read while the import runs so a long transfer survives token rotation. Overrides --access-token; falls back to $VANDELAY_GRAPH_TOKEN_FILE."
+    )]
+    access_token_file: Option<PathBuf>,
+
+    #[arg(
+        long,
         value_name = "LIST",
         help = "Comma-separated surface list (mail,calendar,contacts; default all)"
     )]
@@ -1198,8 +1205,15 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
     let common = common_config(&args.global, args.archive.clone());
     let mailbox_kind = args.mailbox_kind;
     let event_body_format = args.event_body_format;
+    // A token FILE (flag or $VANDELAY_GRAPH_TOKEN_FILE) enables the refreshable flow.
+    let access_token_file = args
+        .access_token_file
+        .clone()
+        .or_else(|| std::env::var_os("VANDELAY_GRAPH_TOKEN_FILE").map(PathBuf::from))
+        .filter(|p| !p.as_os_str().is_empty());
     let auth = resolve_graph_auth(
         args.access_token.as_ref(),
+        access_token_file,
         args.client_id.as_deref(),
         &args.tenant,
     )?;
@@ -1231,9 +1245,20 @@ fn resolve_exchange_graph_import(args: ExchangeGraphImportArgs) -> Result<Action
 
 fn resolve_graph_auth(
     access_token: Option<&Option<String>>,
+    access_token_file: Option<PathBuf>,
     client_id: Option<&str>,
     tenant: &str,
 ) -> Result<GraphAuth, Error> {
+    // A refreshable token FILE wins over a static token: read the initial value from it
+    // and keep the path so the importer re-reads it as the caller rotates the token.
+    if let Some(path) = access_token_file {
+        let token = crate::exchange_graph::oauth::read_token_file(&path)
+            .map_err(|e| Error::Usage(format!("--access-token-file {}: {e}", path.display())))?;
+        return Ok(GraphAuth::PreAcquiredFile {
+            token,
+            refresh_file: path,
+        });
+    }
     if let Some(slot) = access_token {
         let token = secret::resolve(slot.as_deref(), "VANDELAY_GRAPH_TOKEN", "bearer token")?;
         return Ok(GraphAuth::PreAcquired { token });

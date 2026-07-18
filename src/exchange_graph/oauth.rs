@@ -5,6 +5,7 @@
  */
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -290,6 +291,25 @@ fn device_code_flow(
     }
 }
 
+/// Read a bearer token from a file, trimmed of surrounding whitespace/newlines.
+///
+/// This backs the `--access-token-file` flow: the caller (a portal-driven worker)
+/// keeps the file holding a currently-valid app-only Graph token and rotates it well
+/// before expiry, so a long import re-reads the file and never runs on a dead token.
+/// An empty file is an error — a valid token is never the empty string, and silently
+/// swapping in "" would only turn a clear "file not ready" into a confusing 401.
+pub fn read_token_file(path: &Path) -> io::Result<String> {
+    let raw = std::fs::read_to_string(path)?;
+    let token = raw.trim().to_owned();
+    if token.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "token file is empty",
+        ));
+    }
+    Ok(token)
+}
+
 pub fn refresh_access_token(
     authority: &str,
     client_id: &str,
@@ -518,6 +538,27 @@ mod tests {
     fn urlencode_escapes_special_chars() {
         assert_eq!(urlencode("a b/c"), "a%20b%2Fc");
         assert_eq!(urlencode("plain.123_-"), "plain.123_-");
+    }
+
+    #[test]
+    fn read_token_file_trims_surrounding_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "  eyJhbGci.payload.sig\n").unwrap();
+        assert_eq!(read_token_file(&path).unwrap(), "eyJhbGci.payload.sig");
+    }
+
+    #[test]
+    fn read_token_file_rejects_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "\n  \n").unwrap();
+        assert!(read_token_file(&path).is_err());
+    }
+
+    #[test]
+    fn read_token_file_errors_when_absent() {
+        assert!(read_token_file(Path::new("/nonexistent/vandelay/token")).is_err());
     }
 
     #[test]
