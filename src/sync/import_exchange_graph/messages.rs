@@ -101,8 +101,20 @@ fn fetch_and_insert(
             Err(e) => (id, Err(e)),
         }
     });
-    for id in ids {
-        pool.submit(id.clone());
+    // Bound how many message bodies are in flight so the fetch pool cannot buffer an entire
+    // (multi-GB) folder of MIME bodies in memory faster than the single SQLite writer drains
+    // them. Submitting every id up front let the unbounded result backlog grow with the folder
+    // size while the writer periodically stalled on a WAL commit against a large DB — which
+    // OOM-killed the process on a big mailbox (an Inbox with tens of thousands of messages).
+    // Instead admit an initial WINDOW of ids, then top the window up by one for every result
+    // drained, so at most `window` bodies (queued + in-flight + awaiting insert) are ever
+    // resident, independent of folder size. Job ids are tiny, so the job side stays unbounded;
+    // only the heavy result side is throttled, and the writer still commits in CHUNK_SIZE batches.
+    let window = (ctx.workers * 2).max(8);
+    let mut submitted = 0usize;
+    while submitted < ids.len() && submitted < window {
+        pool.submit(ids[submitted].clone());
+        submitted += 1;
     }
     let mut tx_opt: Option<Transaction<'_>> = None;
     let mut in_batch: usize = 0;
@@ -110,6 +122,11 @@ fn fetch_and_insert(
         let Ok((graph_id, result)) = pool.results().recv() else {
             break;
         };
+        // Keep the pipeline full without unbounding it: each drained result admits the next id.
+        if submitted < ids.len() {
+            pool.submit(ids[submitted].clone());
+            submitted += 1;
+        }
         match result {
             Ok(bytes) => {
                 if tx_opt.is_none() {
