@@ -19,16 +19,20 @@ eula = false
 name = "vandelay"
 path = "src/main.rs"
 
+[features]
+default = ["bundled-sqlite"]
+bundled-sqlite = ["rusqlite/bundled"]
+
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 indexmap = { version = "2.14.0", features = ["serde"] }
-rusqlite = { version = "0.40", features = ["bundled", "blob"] }
+rusqlite = { version = "0.40", features = ["blob"] }
 blake3 = "1.8.5"
 time = { version = "0.3.47", features = ["serde-well-known", "macros"] }
 url= "2.5.8"
 thiserror  = "2.0.18"
-ureq = { version = "3.3.0", features = ["json", "rustls-no-provider", "platform-verifier"] }
+ureq = { version = "3.3.0", default-features = false, features = ["json", "gzip", "rustls-no-provider", "platform-verifier"] }
 clap = { version = "4.6.1", features = ["derive"] }
 crossbeam-channel = "0.5.15"
 num_cpus = "1.17.0"

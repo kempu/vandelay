@@ -101,7 +101,7 @@ struct GlobalArgs {
         long_help = "Increase log verbosity (repeatable, max -vvv).\n  \
             (default) per-type start/finish lines and a final summary\n  \
             -v   per-chunk progress, account resolution, retry notices\n  \
-            -vv  every JMAP call (method, accountId, args, status, timing)\n  \
+            -vv  every protocol call (method/command, target, status, timing)\n  \
             -vvv full request/response bodies and backoff delays (stderr)"
     )]
     verbose: u8,

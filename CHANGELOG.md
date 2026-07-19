@@ -25,7 +25,10 @@ live in the MailPortal repo `docs/vandelay-patches.md`.
 ### Changed
 
 ### Fixed
+- Improve verbosity (#4 #19).
 - WebDAV import materialised the account root collection as a directory named after the account displayname (#18).
+- Report user friendly error message when `urn:ietf:params:jmap:principals` is not supported and no accountId is provided (#21).
+- Report which email failed to import when the blob is too large (#22).
 
 ## [1.0.6] - 2026-07-12
 

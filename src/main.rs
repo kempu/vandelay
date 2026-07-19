@@ -12,7 +12,6 @@ use vandelay::inspect;
 use vandelay::sync::{self, Summary};
 
 fn main() {
-    vandelay::install_default_crypto_provider();
     let code = run();
     std::process::exit(code);
 }

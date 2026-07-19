@@ -58,11 +58,14 @@ fn session_json(base: &str) -> String {
         "apiUrl": format!("{base}/jmap/api"),
         "uploadUrl": format!("{base}/jmap/upload/{{accountId}}/"),
         "downloadUrl": format!("{base}/jmap/dl/{{accountId}}/{{blobId}}/{{type}}/{{name}}"),
-        "capabilities": { "urn:ietf:params:jmap:core": {
-            "maxObjectsInGet": 500, "maxObjectsInSet": 500, "maxCallsInRequest": 16,
-            "maxConcurrentRequests": 4, "maxConcurrentUpload": 4,
-            "maxSizeRequest": 10000000, "maxSizeUpload": 50000000
-        } },
+        "capabilities": {
+            "urn:ietf:params:jmap:core": {
+                "maxObjectsInGet": 500, "maxObjectsInSet": 500, "maxCallsInRequest": 16,
+                "maxConcurrentRequests": 4, "maxConcurrentUpload": 4,
+                "maxSizeRequest": 10000000, "maxSizeUpload": 50000000
+            },
+            "urn:ietf:params:jmap:principals": {}
+        },
         "accounts": { "w": { "name": "alice@example.org",
             "accountCapabilities": { "urn:ietf:params:jmap:mail": {} } } }
     })
@@ -363,6 +366,35 @@ fn principal_ambiguous_exact_match_is_rejected() {
     let err =
         account::resolve(&AccountSelector::Name("dup".into()), &session, &client(1)).unwrap_err();
     assert_eq!(err.exit_code(), 3);
+}
+
+#[test]
+fn principal_unknown_capability_400_is_actionable() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let session: Session = serde_json::from_str(&session_json(&base)).unwrap();
+    server
+        .mock("POST", "/jmap/api")
+        .with_status(400)
+        .with_body(
+            json!({
+                "type": "urn:ietf:params:jmap:error:unknownCapability",
+                "status": 400,
+                "detail": "The Request object used capability \
+                           'urn:ietf:params:jmap:principals', which is not supported \
+                           by this server."
+            })
+            .to_string(),
+        )
+        .create();
+
+    let err =
+        account::resolve(&AccountSelector::Name("ghost".into()), &session, &client(0)).unwrap_err();
+    assert_eq!(err.exit_code(), 3);
+    let msg = err.to_string();
+    assert!(msg.contains("urn:ietf:params:jmap:principals"));
+    assert!(msg.contains("--account-id"));
+    assert!(msg.contains("alice@example.org (w)"));
 }
 
 #[test]

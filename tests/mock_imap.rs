@@ -121,6 +121,7 @@ fn connect_mock(server: &MockImap) -> Result<ImapClient, ImapError> {
         "127.0.0.1",
         server.port,
         ConnectMode::Plain,
+        Logger::from_flags(false, 0),
     )
 }
 

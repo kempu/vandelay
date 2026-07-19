@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{BufReader, Read, Write};
+use std::time::Instant;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -14,6 +15,7 @@ use super::command::{self, CommandBuilder};
 use super::error::{ImapError, NoError};
 use super::response::{Response, Status, StatusLine, Untagged, parse_response};
 use super::transport::{Connector, ImapStream};
+use crate::logging::Logger;
 
 pub struct ImapClient {
     reader: BufReader<Box<dyn ImapStream>>,
@@ -22,6 +24,7 @@ pub struct ImapClient {
     pub host: String,
     closed: bool,
     utf8_accept: bool,
+    logger: Logger,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +47,7 @@ impl ImapClient {
         host: &str,
         port: u16,
         mode: ConnectMode,
+        logger: Logger,
     ) -> Result<ImapClient, ImapError> {
         let stream: Box<dyn ImapStream> = match mode {
             ConnectMode::ImplicitTls => connector.connect_tls(host, port)?,
@@ -56,6 +60,7 @@ impl ImapClient {
             host: host.to_owned(),
             closed: false,
             utf8_accept: false,
+            logger,
         };
         client.read_greeting()?;
         client.send_capability()?;
@@ -337,12 +342,19 @@ impl ImapClient {
                     .into(),
             ));
         }
+        let started = Instant::now();
         self.write_all(&bytes)?;
         loop {
             let resp = parse_response(&mut self.reader)?;
             match resp {
                 Response::Tagged { tag: t, line } if t == tag => {
                     self.update_capabilities_from_code(&line);
+                    self.logger.trace_cmd(
+                        "IMAP",
+                        command,
+                        &format!("{} {}", status_word(&line.status), line.text),
+                        started.elapsed(),
+                    );
                     return match line.status {
                         Status::Ok => Ok(line),
                         Status::No => Err(ImapError::No(line.into_no_error())),
@@ -388,6 +400,7 @@ impl ImapClient {
                     .into(),
             ));
         }
+        let started = Instant::now();
         self.write_all(&bytes)?;
         let mut untagged = Vec::new();
         loop {
@@ -395,6 +408,12 @@ impl ImapClient {
             match resp {
                 Response::Tagged { tag: t, line } if t == tag => {
                     self.update_capabilities_from_code(&line);
+                    self.logger.trace_cmd(
+                        "IMAP",
+                        command,
+                        &format!("{} {}", status_word(&line.status), line.text),
+                        started.elapsed(),
+                    );
                     return match line.status {
                         Status::Ok => Ok(CollectedResponse {
                             tag,
@@ -473,6 +492,16 @@ pub struct CollectedResponse {
     pub tag: String,
     pub line: StatusLine,
     pub untagged: Vec<Untagged>,
+}
+
+fn status_word(status: &Status) -> &'static str {
+    match status {
+        Status::Ok => "OK",
+        Status::No => "NO",
+        Status::Bad => "BAD",
+        Status::Bye => "BYE",
+        Status::PreAuth => "PREAUTH",
+    }
 }
 
 fn parse_caps(s: &str) -> BTreeSet<String> {
@@ -569,6 +598,7 @@ mod tests {
             host: "test.example".to_owned(),
             closed: false,
             utf8_accept: false,
+            logger: Logger::from_flags(true, 0),
         }
     }
 

@@ -21,6 +21,7 @@ pub struct DavSeed {
 
 impl DavSeed {
     pub fn new(base: impl Into<String>, user: &str, password: &str) -> Self {
+        super::install_crypto_provider();
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .allow_non_standard_methods(true)

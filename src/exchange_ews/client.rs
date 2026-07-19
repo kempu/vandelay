@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -22,7 +22,7 @@ use crate::exchange_ews::soap::{EnvelopeOptions, soap_action, wrap_envelope};
 use crate::exchange_ews::types::ServerVersion;
 use crate::jmap::http::{Auth, RetryPolicy, retry_after_header};
 use crate::jmap::retry::{self, Disposition, RateLimitState};
-use crate::logging::{LEVEL_BODIES, LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
+use crate::logging::{HttpCall, LEVEL_BODIES, LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
 
 const MAX_BODY: u64 = 2 * 1024 * 1024 * 1024;
 const LONG_RETRY_THRESHOLD: Duration = Duration::from_secs(10);
@@ -61,6 +61,9 @@ impl EwsClient {
             .redirect_auth_headers(RedirectAuthHeaders::SameHost)
             .tls_config(
                 TlsConfig::builder()
+                    .unversioned_rustls_crypto_provider(std::sync::Arc::new(
+                        rustls::crypto::aws_lc_rs::default_provider(),
+                    ))
                     .root_certs(RootCerts::PlatformVerifier)
                     .disable_verification(allow_invalid_certs)
                     .build(),
@@ -424,10 +427,17 @@ impl EwsClient {
         if let Some(cookie) = self.affinity_cookie() {
             req = req.header("X-BackEndOverrideCookie", cookie);
         }
+        let logger = self.logger();
+        let started = Instant::now();
         let result = req.send(body.as_bytes());
         match result {
             Ok(mut resp) => {
                 let status = resp.status().as_u16();
+                let response_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
                 let retry_after = resp
                     .headers()
                     .get("retry-after")
@@ -439,17 +449,35 @@ impl EwsClient {
                     *g = Some(cookie);
                 }
                 match resp.body_mut().with_config().limit(MAX_BODY).read_to_vec() {
-                    Ok(bytes) => AttemptOutcome::Ok {
-                        status,
-                        body: bytes,
-                        retry_after,
-                    },
+                    Ok(bytes) => {
+                        logger.trace_http(&HttpCall {
+                            proto: "EWS",
+                            method: action,
+                            url,
+                            status,
+                            elapsed: started.elapsed(),
+                            note: None,
+                            request: Some(body.as_bytes()),
+                            request_type: Some("text/xml"),
+                            response: &bytes,
+                            response_type: response_type.as_deref(),
+                        });
+                        AttemptOutcome::Ok {
+                            status,
+                            body: bytes,
+                            retry_after,
+                        }
+                    }
                     Err(e) => AttemptOutcome::Transport(EwsError::Transport(format!(
                         "reading response body: {e}"
                     ))),
                 }
             }
-            Err(e) => AttemptOutcome::Transport(map_ureq_error(e)),
+            Err(e) => {
+                let err = map_ureq_error(e);
+                logger.trace_http_error("EWS", action, url, &err.to_string(), started.elapsed());
+                AttemptOutcome::Transport(err)
+            }
         }
     }
 }

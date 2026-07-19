@@ -17,6 +17,7 @@ use crate::imap::name::encode_mailbox_name_with;
 use crate::imap::response::Untagged;
 use crate::imap::retry::{BackoffState, Disposition, RetryPolicy, classify};
 use crate::imap::transport::Connector;
+use crate::logging::Logger;
 
 use super::coordinator::{Endpoint, ImapAuth, authenticate_client};
 use super::fetch::FetchAttrs;
@@ -51,6 +52,7 @@ pub struct WorkerArgs {
     pub compress: bool,
     pub policy: RetryPolicy,
     pub backoff: BackoffState,
+    pub logger: Logger,
 }
 
 pub struct WorkerPool {
@@ -208,6 +210,7 @@ fn connect_and_auth(args: &WorkerArgs) -> Result<ImapClient, ImapError> {
         &args.endpoint.host,
         args.endpoint.port,
         args.mode,
+        args.logger,
     )?;
     authenticate_client(&mut client, &args.auth)
         .map_err(|e| ImapError::AuthFailed(e.to_string()))?;

@@ -143,6 +143,30 @@ fn build_keywords(row: &EmailRow) -> Map<String, Value> {
     kw
 }
 
+fn blob_hint(uploader: &Uploader, row: &EmailRow) -> String {
+    let idx = index_from_json(&row.message_match);
+    let mut s = match idx.mids.first() {
+        Some(mid) => format!("message-id <{mid}>"),
+        None => "no message-id".to_owned(),
+    };
+    if let Some(len) = uploader.blob_len(row.blob_local_id) {
+        use std::fmt::Write;
+        let _ = write!(s, ", {}", crate::inspect::format_bytes(len));
+    }
+    s
+}
+
+fn size_note(e: &JmapError) -> &'static str {
+    if matches!(
+        e,
+        JmapError::RequestTooLarge | JmapError::SingleObjectTooLarge(_)
+    ) {
+        "; exceeds the target server size limit, so this message is skipped and re-running will not migrate it"
+    } else {
+        ""
+    }
+}
+
 fn import_item(
     blob: String,
     mids: Map<String, Value>,
@@ -171,7 +195,8 @@ fn export_one(
         Some(m) => m,
         None => {
             logger.warn(&format!(
-                "email local {local_id} skipped: mailbox not on target"
+                "Email/import {cid} ({}) skipped: mailbox not on target",
+                blob_hint(uploader, row)
             ));
             counts.failed += 1;
             return;
@@ -180,7 +205,11 @@ fn export_one(
     let blob = match uploader.upload_with(row.blob_local_id, "message/rfc822") {
         Ok(b) => b.0,
         Err(e) => {
-            logger.warn(&format!("email blob upload failed: {e}"));
+            logger.warn(&format!(
+                "Email/import {cid} ({}) blob upload failed: {e}{}",
+                blob_hint(uploader, row),
+                size_note(&e)
+            ));
             counts.failed += 1;
             return;
         }
@@ -197,11 +226,18 @@ fn export_one(
             retry_after_reupload(net, uploader, maps, &cid, row, counts, logger);
         }
         Ok(SingleImport::NotCreated { detail, .. }) => {
-            logger.warn(&format!("Email/import {cid} failed: {detail}"));
+            logger.warn(&format!(
+                "Email/import {cid} ({}) failed: {detail}",
+                blob_hint(uploader, row)
+            ));
             counts.failed += 1;
         }
         Err(e) => {
-            logger.warn(&format!("Email/import {cid} send failed: {e}"));
+            logger.warn(&format!(
+                "Email/import {cid} ({}) send failed: {e}{}",
+                blob_hint(uploader, row),
+                size_note(&e)
+            ));
             counts.failed += 1;
         }
     }
@@ -220,7 +256,11 @@ fn retry_after_reupload(
     let blob = match uploader.upload_with(row.blob_local_id, "message/rfc822") {
         Ok(b) => b.0,
         Err(e) => {
-            logger.warn(&format!("Email/import {cid}: blob re-upload failed: {e}"));
+            logger.warn(&format!(
+                "Email/import {cid} ({}) blob re-upload failed: {e}{}",
+                blob_hint(uploader, row),
+                size_note(&e)
+            ));
             counts.failed += 1;
             return;
         }
@@ -229,7 +269,8 @@ fn retry_after_reupload(
         Some(m) => m,
         None => {
             logger.warn(&format!(
-                "Email/import {cid} skipped: mailbox not on target"
+                "Email/import {cid} ({}) skipped: mailbox not on target",
+                blob_hint(uploader, row)
             ));
             counts.failed += 1;
             return;
@@ -241,13 +282,16 @@ fn retry_after_reupload(
         Ok(SingleImport::Skipped) => counts.skipped += 1,
         Ok(SingleImport::NotCreated { detail, .. }) => {
             logger.warn(&format!(
-                "Email/import {cid} failed after blob re-upload: {detail}"
+                "Email/import {cid} ({}) failed after blob re-upload: {detail}",
+                blob_hint(uploader, row)
             ));
             counts.failed += 1;
         }
         Err(e) => {
             logger.warn(&format!(
-                "Email/import {cid} send failed after blob re-upload: {e}"
+                "Email/import {cid} ({}) send failed after blob re-upload: {e}{}",
+                blob_hint(uploader, row),
+                size_note(&e)
             ));
             counts.failed += 1;
         }

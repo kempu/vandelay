@@ -155,6 +155,7 @@ fn reconnect_control(client: &mut ImapClient, ctx: &ControlCtx) -> Result<(), Im
         &ctx.endpoint.host,
         ctx.endpoint.port,
         ctx.mode,
+        ctx.logger,
     )?;
     *client = new_client;
     authenticate_client(client, &ctx.auth).map_err(|e| ImapError::AuthFailed(e.to_string()))?;
@@ -224,7 +225,7 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
     } else {
         ConnectMode::StartTls
     };
-    let mut client = ImapClient::connect(&connector, &endpoint.host, endpoint.port, mode)
+    let mut client = ImapClient::connect(&connector, &endpoint.host, endpoint.port, mode, logger)
         .map_err(|e| Error::Connection(e.to_string()))?;
 
     let account_id = authenticate(&mut client, &config.auth)?;
@@ -389,6 +390,7 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
             compress: config.compress,
             policy,
             backoff: backoff.clone(),
+            logger,
         },
         config.imap_connections.max(1),
     )
