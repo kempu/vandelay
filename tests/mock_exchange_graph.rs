@@ -31,7 +31,7 @@ fn client_with_retries(retries: u32) -> GraphClient {
 
 fn url_message_collection(server_url: &str, folder: &str, top: usize) -> String {
     let e = Endpoints::for_me(server_url);
-    e.folder_messages_ids(folder, top)
+    e.folder_messages_meta(folder, top)
 }
 
 fn make_jwt(exp: u64, upn: &str) -> String {
@@ -185,7 +185,10 @@ fn pagination_collects_ids_across_three_pages_with_one_empty() {
     .to_string();
 
     let _m1 = server
-        .mock("GET", "/me/mailFolders/F1/messages?$top=100&$select=id")
+        .mock(
+            "GET",
+            "/me/mailFolders/F1/messages?$top=100&$select=id,isRead,flag",
+        )
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(page1)
@@ -219,7 +222,10 @@ fn pagination_terminates_when_no_next_link_present() {
     let base = server.url();
     let body = json!({"value": [{"id": "A"}, {"id": "B"}]}).to_string();
     let _m = server
-        .mock("GET", "/me/mailFolders/F/messages?$top=100&$select=id")
+        .mock(
+            "GET",
+            "/me/mailFolders/F/messages?$top=100&$select=id,isRead,flag",
+        )
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(body)
@@ -247,7 +253,10 @@ fn header_redelivery_is_asserted_via_mockito_match() {
     .to_string();
     let page2 = json!({"value": [{"id": "OnlyOnPageTwo"}]}).to_string();
     let _m1 = server
-        .mock("GET", "/me/mailFolders/F/messages?$top=100&$select=id")
+        .mock(
+            "GET",
+            "/me/mailFolders/F/messages?$top=100&$select=id,isRead,flag",
+        )
         .match_header("prefer", "IdType=\"ImmutableId\"")
         .match_header("authorization", "Bearer BEARER")
         .with_status(200)
@@ -274,7 +283,10 @@ fn case_sensitive_immutable_id_round_trip() {
     let id = "AAkAAGFsaWNlAAA=";
     let body = json!({"value": [{"id": id}]}).to_string();
     let _m = server
-        .mock("GET", "/me/mailFolders/F/messages?$top=100&$select=id")
+        .mock(
+            "GET",
+            "/me/mailFolders/F/messages?$top=100&$select=id,isRead,flag",
+        )
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(body)
@@ -662,7 +674,10 @@ fn integration_full_run_mail_only_imports_mime_via_value() {
     })
     .collect();
     let _ids = server
-        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id")
+        .mock(
+            "GET",
+            "/me/mailFolders/FMAIL/messages?$top=100&$select=id,isRead,flag",
+        )
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"value":[{"id":"MSG-1"}]}"#)
@@ -761,7 +776,10 @@ fn integration_duplicate_message_id_does_not_abort_run() {
     })
     .collect();
     let _ids = server
-        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id")
+        .mock(
+            "GET",
+            "/me/mailFolders/FMAIL/messages?$top=100&$select=id,isRead,flag",
+        )
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"value":[{"id":"MSG-1"},{"id":"MSG-1"}]}"#)
@@ -860,7 +878,10 @@ fn integration_full_run_is_convergent_on_second_invocation() {
             .create();
     }
     let _ids = server
-        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id")
+        .mock(
+            "GET",
+            "/me/mailFolders/FMAIL/messages?$top=100&$select=id,isRead,flag",
+        )
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"value":[{"id":"MSG-A"}]}"#)
@@ -1352,7 +1373,7 @@ fn hidden_mail_folder_has_is_subscribed_zero() {
     server
         .mock(
             "GET",
-            "/me/mailFolders/FVISIBLE/messages?$top=100&$select=id",
+            "/me/mailFolders/FVISIBLE/messages?$top=100&$select=id,isRead,flag",
         )
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -1361,7 +1382,7 @@ fn hidden_mail_folder_has_is_subscribed_zero() {
     server
         .mock(
             "GET",
-            "/me/mailFolders/FHIDDEN/messages?$top=100&$select=id",
+            "/me/mailFolders/FHIDDEN/messages?$top=100&$select=id,isRead,flag",
         )
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -1446,7 +1467,7 @@ fn well_known_folder_probes_assign_jmap_roles() {
         server
             .mock(
                 "GET",
-                format!("/me/mailFolders/{fid}/messages?$top=100&$select=id").as_str(),
+                format!("/me/mailFolders/{fid}/messages?$top=100&$select=id,isRead,flag").as_str(),
             )
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -1527,7 +1548,10 @@ fn attachment_message_does_not_trigger_attachments_endpoint() {
         .create();
     stub_well_known_folders(&mut server, "FMAIL");
     server
-        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id")
+        .mock(
+            "GET",
+            "/me/mailFolders/FMAIL/messages?$top=100&$select=id,isRead,flag",
+        )
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"value":[{"id":"MSG-ATT"}]}"#)
@@ -1734,7 +1758,7 @@ fn full_run_records_graph_id_in_sync_id_exchange_graph_with_padding() {
     let _ids = server
         .mock(
             "GET",
-            "/me/mailFolders/AAkA-Padded%3D%3D/messages?$top=100&$select=id",
+            "/me/mailFolders/AAkA-Padded%3D%3D/messages?$top=100&$select=id,isRead,flag",
         )
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -2122,7 +2146,10 @@ fn folder_enumeration_failure_skips_vanished_deletion() {
             .create();
     }
     let _enum_fail = server
-        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id")
+        .mock(
+            "GET",
+            "/me/mailFolders/FMAIL/messages?$top=100&$select=id,isRead,flag",
+        )
         .with_status(503)
         .with_body("transient outage")
         .create();

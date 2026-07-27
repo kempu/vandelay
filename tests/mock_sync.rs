@@ -3264,3 +3264,1413 @@ fn import_jmap_duplicate_role_is_deduplicated_to_single_mailbox() {
     drop(conn);
     let _ = std::fs::remove_file(&archive);
 }
+
+// ---------------------------------------------------------------------------
+// Per-item export failures.
+//
+// Aggregate counters (`Email: ... failed=N`) tell a caller how many items the
+// target refused but not which ones, so every failing path now also writes a
+// structured row into the archive. The blobNotFound cases below model a
+// CONTENT-ADDRESSED target: byte-identical uploads come back with the SAME
+// blobId, which is what makes a re-upload incapable of clearing a de-duplication
+// marker whose bytes have gone missing from the blob store.
+// ---------------------------------------------------------------------------
+
+fn session_body_blob(base: &str) -> String {
+    json!({
+        "apiUrl": format!("{base}/jmap/api"),
+        "uploadUrl": format!("{base}/jmap/upload/{{accountId}}/"),
+        "downloadUrl": format!("{base}/jmap/dl/{{accountId}}/{{blobId}}/{{type}}/{{name}}"),
+        "capabilities": { "urn:ietf:params:jmap:core": {
+            "maxObjectsInGet": 500, "maxObjectsInSet": 500, "maxCallsInRequest": 16,
+            "maxConcurrentRequests": 4, "maxConcurrentUpload": 4,
+            "maxSizeRequest": 10000000, "maxSizeUpload": 50000000
+        } },
+        "accounts": { "w": { "name": "alice",
+            "accountCapabilities": {
+                "urn:ietf:params:jmap:mail": {},
+                "urn:ietf:params:jmap:blob": {}
+            } } }
+    })
+    .to_string()
+}
+
+fn seed_one_email(archive: &Path, mid: &str) -> Vec<u8> {
+    let conn = db::init::open(archive).unwrap();
+    conn.execute(
+        "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+        [],
+    )
+    .unwrap();
+    let raw = format!(
+        "From: alex@example.test\r\nSubject: quarantine\r\nMessage-ID: <{mid}>\r\n\r\nbody"
+    )
+    .into_bytes();
+    let blob = db::blobs::intern_blob(&conn, &raw).unwrap();
+    conn.execute(
+        "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords,message_match)
+         VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]',?2)",
+        rusqlite::params![blob, json!({ "m": [mid], "f": "0".repeat(64) }).to_string()],
+    )
+    .unwrap();
+    raw
+}
+
+/// Mailbox side of an email export: one mailbox already on the target, mapped
+/// by name, so the run gets straight to the message.
+fn export_mailbox_scaffold(server: &mut mockito::Server, api: &str) -> Vec<mockito::Mock> {
+    let term = anchor_terminator(server, api, "Mailbox");
+    let query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+            {"accountId":"w","ids":["t1"]},"q"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
+            {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
+             "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    vec![term, query, get]
+}
+
+fn empty_email_query(server: &mut mockito::Server, api: &str) -> mockito::Mock {
+    server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",
+            {"accountId":"w","ids":[]},"q"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create()
+}
+
+fn failures_in(archive: &Path) -> Vec<db::export_failures::FailedItem> {
+    let conn = db::init::open(archive).unwrap();
+    db::export_failures::list(&conn, None, 0).unwrap()
+}
+
+fn email_counts(summary: &sync::Summary) -> sync::TypeCounts {
+    summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts")
+}
+
+#[test]
+fn export_email_failure_is_recorded_as_a_structured_item() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    let raw = seed_one_email(&archive, "q-1@h");
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .expect_at_least(1)
+        .create();
+    let _scaffold = export_mailbox_scaffold(&mut server, api);
+    let _eq = empty_email_query(&mut server, api);
+    let _up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP1"}).to_string())
+        .expect(1)
+        .create();
+    let imp = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "notCreated":{"e1":{"type":"invalidProperties",
+                                    "description":"receivedAt is not a UTCDate"}}},"i"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("export run");
+
+    let email = email_counts(&summary);
+    assert_eq!(email.failed, 1, "the refused message counts as failed");
+    assert_eq!(email.created, 0);
+    imp.assert();
+
+    let rows = failures_in(&archive);
+    assert_eq!(
+        rows.len(),
+        1,
+        "one quarantine row per refused item: {rows:?}"
+    );
+    let row = &rows[0];
+    assert_eq!(row.type_name, "email");
+    assert_eq!(row.local_id, 1);
+    assert_eq!(row.client_id, "e1", "the creation id used on the wire");
+    assert_eq!(row.message_id.as_deref(), Some("q-1@h"));
+    assert_eq!(row.size_bytes, Some(raw.len() as i64));
+    assert_eq!(row.target_blob_id.as_deref(), Some("UP1"));
+    assert_eq!(row.error_type, "invalidProperties");
+    assert!(
+        row.error_detail.contains("receivedAt is not a UTCDate"),
+        "the full target detail is kept: {}",
+        row.error_detail
+    );
+    assert_eq!(
+        row.blob_probe, "not_probed",
+        "no blob probe runs for a failure that is not blobNotFound"
+    );
+    assert_eq!(
+        row.blob_hash.as_deref(),
+        Some(blake3::hash(&raw).to_hex().to_string().as_str()),
+        "the full content hash correlates the item with the target's dedup key"
+    );
+    assert_eq!(
+        row.blob_local_id,
+        Some(1),
+        "the bytes stay reachable in the archive"
+    );
+    assert!(row.failed_at.ends_with('Z'), "got {}", row.failed_at);
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_email_failure_row_is_replaced_not_duplicated_on_rerun() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    seed_one_email(&archive, "q-2@h");
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .expect_at_least(1)
+        .create();
+    let _scaffold = export_mailbox_scaffold(&mut server, api);
+    let _eq = empty_email_query(&mut server, api);
+    let _up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP1"}).to_string())
+        .expect(2)
+        .create();
+    let first = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "notCreated":{"e1":{"type":"invalidProperties"}}},"i"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let second = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "notCreated":{"e1":{"type":"overQuota"}}},"i"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    for pass in 1..=2 {
+        let summary = sync::export::run(
+            common(&archive),
+            export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+        )
+        .unwrap_or_else(|e| panic!("export pass {pass}: {e}"));
+        assert_eq!(email_counts(&summary).failed, 1, "pass {pass}");
+    }
+    first.assert();
+    second.assert();
+
+    let rows = failures_in(&archive);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a re-run overwrites the row instead of appending: {rows:?}"
+    );
+    assert_eq!(
+        rows[0].error_type, "overQuota",
+        "the row reflects the latest attempt, not the first"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_email_blob_not_found_on_content_addressed_target_records_orphaned_marker() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    seed_one_email(&archive, "q-3@h");
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_blob(&base))
+        .expect_at_least(1)
+        .create();
+    let _scaffold = export_mailbox_scaffold(&mut server, api);
+    let _eq = empty_email_query(&mut server, api);
+    // Identical bytes hash the same, so a content-addressed target hands back
+    // the same blobId for both uploads: the re-upload is de-duplicated away.
+    let up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP1"}).to_string())
+        .expect(2)
+        .create();
+    let imp = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "notCreated":{"e1":{"type":"blobNotFound"}}},"i"]]})
+            .to_string(),
+        )
+        .expect(2)
+        .create();
+    let probe = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Blob/get".into()),
+            Matcher::Regex("UP1".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Blob/get",
+            {"accountId":"w","list":[],"notFound":["UP1"]},"b"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("export run");
+
+    assert_eq!(
+        email_counts(&summary).failed,
+        1,
+        "a blobNotFound that survives the re-upload is a real failure, not a self-heal"
+    );
+    assert!(summary.any_failed());
+    up.assert();
+    imp.assert();
+    probe.assert();
+
+    let rows = failures_in(&archive);
+    assert_eq!(rows.len(), 1, "got {rows:?}");
+    assert_eq!(rows[0].error_type, "blobNotFound");
+    assert_eq!(rows[0].target_blob_id.as_deref(), Some("UP1"));
+    assert_eq!(
+        rows[0].blob_probe, "orphaned_marker",
+        "upload 200 plus Blob/get notFound is the orphaned dedup marker signature"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_email_blob_probe_failure_is_recorded_as_store_unavailable_not_orphaned() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    seed_one_email(&archive, "q-4@h");
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_blob(&base))
+        .expect_at_least(1)
+        .create();
+    let _scaffold = export_mailbox_scaffold(&mut server, api);
+    let _eq = empty_email_query(&mut server, api);
+    let _up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP1"}).to_string())
+        .expect(2)
+        .create();
+    let _imp = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "notCreated":{"e1":{"type":"blobNotFound"}}},"i"]]})
+            .to_string(),
+        )
+        .expect(2)
+        .create();
+    let probe = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Blob/get".into()))
+        .with_status(500)
+        .with_body("blob store unreachable")
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("export run");
+
+    assert_eq!(email_counts(&summary).failed, 1);
+    probe.assert();
+
+    let rows = failures_in(&archive);
+    assert_eq!(rows.len(), 1, "got {rows:?}");
+    assert_eq!(
+        rows[0].blob_probe, "store_unavailable",
+        "a probe that cannot answer must not be read as proof of an orphan"
+    );
+    assert!(
+        rows[0].error_detail.contains("blob probe"),
+        "the probe failure is kept verbatim: {}",
+        rows[0].error_detail
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_email_blob_probe_reads_a_size_only_result_as_retrievable() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    seed_one_email(&archive, "q-4b@h");
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_blob(&base))
+        .expect_at_least(1)
+        .create();
+    let _scaffold = export_mailbox_scaffold(&mut server, api);
+    let _eq = empty_email_query(&mut server, api);
+    let _up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP1"}).to_string())
+        .expect(2)
+        .create();
+    let _imp = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "notCreated":{"e1":{"type":"blobNotFound"}}},"i"]]})
+            .to_string(),
+        )
+        .expect(2)
+        .create();
+    // The probe asks for `properties: ["size"]`. RFC 8620 5.1 says `id` comes
+    // back regardless, but a target that takes the property list literally
+    // answers with the size alone — and in doing so proves it read the bytes out
+    // of its blob store. Only one id was asked about, so the lone entry can only
+    // be about it.
+    let probe = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Blob/get".into()),
+            Matcher::Regex("UP1".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Blob/get",
+            {"accountId":"w","list":[{"size":64}],"notFound":[]},"b"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("export run");
+
+    assert_eq!(email_counts(&summary).failed, 1);
+    probe.assert();
+
+    let rows = failures_in(&archive);
+    assert_eq!(rows.len(), 1, "got {rows:?}");
+    assert_eq!(
+        rows[0].blob_probe, "retrievable",
+        "a target that answered with the blob's size is serving that blob, not \
+         an unhealthy blob store"
+    );
+    assert!(
+        rows[0].error_detail.contains("64 bytes"),
+        "the size the target reported is kept: {}",
+        rows[0].error_detail
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_email_blob_probe_is_unsupported_when_target_lacks_the_blob_capability() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    seed_one_email(&archive, "q-5@h");
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .expect_at_least(1)
+        .create();
+    let _scaffold = export_mailbox_scaffold(&mut server, api);
+    let _eq = empty_email_query(&mut server, api);
+    let _up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP1"}).to_string())
+        .expect(2)
+        .create();
+    let _imp = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "notCreated":{"e1":{"type":"blobNotFound"}}},"i"]]})
+            .to_string(),
+        )
+        .expect(2)
+        .create();
+    let probe = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Blob/get".into()))
+        .with_body(json!({"methodResponses":[["Blob/get",{"accountId":"w"},"b"]]}).to_string())
+        .expect(0)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("export run");
+
+    assert_eq!(email_counts(&summary).failed, 1);
+    probe.assert();
+
+    let rows = failures_in(&archive);
+    assert_eq!(rows.len(), 1, "got {rows:?}");
+    assert_eq!(
+        rows[0].blob_probe, "unsupported",
+        "retrievability is reported as unknown rather than guessed at"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_email_quarantine_row_is_cleared_once_the_item_is_on_target() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    seed_one_email(&archive, "q-6@h");
+    {
+        let conn = db::init::open(&archive).unwrap();
+        db::export_failures::record(
+            &conn,
+            &db::export_failures::FailedItem {
+                type_name: "email".to_owned(),
+                local_id: 1,
+                client_id: "e1".to_owned(),
+                message_id: Some("q-6@h".to_owned()),
+                size_bytes: Some(64),
+                blob_local_id: Some(1),
+                blob_hash: None,
+                target_blob_id: Some("UP1".to_owned()),
+                error_type: "blobNotFound".to_owned(),
+                error_detail: "left over from an earlier run".to_owned(),
+                blob_probe: db::export_failures::PROBE_ORPHANED_MARKER.to_owned(),
+                failed_at: "2026-01-01T00:00:00Z".to_owned(),
+            },
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .expect_at_least(1)
+        .create();
+    let _scaffold = export_mailbox_scaffold(&mut server, api);
+    let _emterm = anchor_terminator(&mut server, api, "Email");
+    let _eq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",
+            {"accountId":"w","ids":["X1"]},"q"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _eg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",{"accountId":"w","list":[
+            {"id":"X1","messageId":["q-6@h"]}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("export run");
+
+    let email = email_counts(&summary);
+    assert_eq!(email.skipped, 1, "the message is already on the target");
+    assert_eq!(email.failed, 0);
+
+    assert!(
+        failures_in(&archive).is_empty(),
+        "a resolved item must not stay quarantined"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+/// A row left behind by an earlier run, of whatever type.
+fn stale_row(type_name: &str, local_id: i64) -> db::export_failures::FailedItem {
+    db::export_failures::FailedItem {
+        type_name: type_name.to_owned(),
+        local_id,
+        client_id: format!("x{local_id}"),
+        message_id: None,
+        size_bytes: Some(64),
+        blob_local_id: Some(1),
+        blob_hash: None,
+        target_blob_id: Some("UP1".to_owned()),
+        error_type: "blobNotFound".to_owned(),
+        error_detail: "recorded before the archive was re-imported".to_owned(),
+        blob_probe: db::export_failures::PROBE_ORPHANED_MARKER.to_owned(),
+        failed_at: "2026-01-01T00:00:00Z".to_owned(),
+    }
+}
+
+#[test]
+fn export_reaps_quarantine_rows_whose_archive_object_is_gone() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    seed_one_email(&archive, "q-8@h");
+    {
+        let conn = db::init::open(&archive).unwrap();
+        // Model the aftermath of a UIDVALIDITY change: the coordinator wipes the
+        // folder's `emails` rows and the re-import inserts the same messages
+        // again under fresh local ids. The row an earlier export left for the OLD
+        // id now names nothing in the archive, and the reconcile loop below only
+        // ever visits the NEW one, so `resolve()` can never reach it.
+        db::export_failures::record(&conn, &stale_row("email", 1)).unwrap();
+        conn.execute("UPDATE emails SET id = 2 WHERE id = 1", [])
+            .unwrap();
+        // A type with no rows at all is dropped from the work list by `has_rows`,
+        // which is precisely the case where every row it has is stale — so the
+        // sweep cannot be hung off the per-type pass and has to cover all types.
+        db::export_failures::record(&conn, &stale_row("sievescript", 7)).unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .expect_at_least(1)
+        .create();
+    let _scaffold = export_mailbox_scaffold(&mut server, api);
+    let _emterm = anchor_terminator(&mut server, api, "Email");
+    let _eq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",
+            {"accountId":"w","ids":["X1"]},"q"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _eg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",{"accountId":"w","list":[
+            {"id":"X1","messageId":["q-8@h"]}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("export run");
+
+    let email = email_counts(&summary);
+    assert_eq!(
+        email.skipped, 1,
+        "the re-imported message is matched under its new local id"
+    );
+    assert_eq!(email.failed, 0);
+
+    assert!(
+        failures_in(&archive).is_empty(),
+        "a row naming an object that is no longer in the archive is a phantom \
+         failure and pins the message bytes against gc; it must not survive the run"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_dry_run_records_no_quarantine_rows() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    seed_one_email(&archive, "q-7@h");
+    {
+        // No mailbox mapping is possible in a dry run against an empty target,
+        // so this item takes a failing path; the archive must still be untouched.
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute("DELETE FROM mailboxes", []).unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .expect_at_least(1)
+        .create();
+    let _emterm = anchor_terminator(&mut server, api, "Email");
+    let _eq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",
+            {"accountId":"w","ids":[]},"q"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+
+    sync::export::run(
+        common_dry(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("dry-run export");
+
+    assert!(
+        failures_in(&archive).is_empty(),
+        "--dry-run must stay side-effect free"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_quarantine_write_failure_is_not_counted_as_a_refused_object() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    seed_one_email(&archive, "q-8@h");
+    {
+        // Stand in for the archive refusing the write (disk full, SQLITE_BUSY):
+        // the item still fails on the target, but its row cannot be laid down.
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "CREATE TRIGGER refuse_quarantine_writes BEFORE INSERT ON export_failures
+             BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .expect_at_least(1)
+        .create();
+    let _scaffold = export_mailbox_scaffold(&mut server, api);
+    let _eq = empty_email_query(&mut server, api);
+    let _up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP1"}).to_string())
+        .expect(1)
+        .create();
+    let _imp = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/import".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "notCreated":{"e1":{"type":"invalidProperties",
+                                    "description":"receivedAt is not a UTCDate"}}},"i"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("export run");
+
+    assert_eq!(
+        email_counts(&summary).failed,
+        1,
+        "one message was refused, so `failed` is 1: a bookkeeping error must not \
+         add a unit that corresponds to no item, or a consumer reconciling \
+         failed=N against the rows finds a discrepancy it cannot attribute"
+    );
+    assert_eq!(
+        summary.unrecorded_failures.len(),
+        1,
+        "the lost row is still surfaced, on its own channel: {:?}",
+        summary.unrecorded_failures
+    );
+    assert!(
+        summary.unrecorded_failures[0].contains("Email")
+            && summary.unrecorded_failures[0].contains("disk I/O error"),
+        "the signal names the type and the write error: {}",
+        summary.unrecorded_failures[0]
+    );
+
+    assert!(
+        failures_in(&archive).is_empty(),
+        "the write was refused, so there is no row"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+/// Sieve is exported through the same content-addressed blob endpoint as mail,
+/// and both the sieve and the blob capability have to be on for the probe to
+/// run, so neither `session_body_full` nor `session_body_blob` alone will do.
+fn session_body_sieve_blob(base: &str) -> String {
+    json!({
+        "apiUrl": format!("{base}/jmap/api"),
+        "uploadUrl": format!("{base}/jmap/upload/{{accountId}}/"),
+        "downloadUrl": format!("{base}/jmap/dl/{{accountId}}/{{blobId}}/{{type}}/{{name}}"),
+        "capabilities": { "urn:ietf:params:jmap:core": {
+            "maxObjectsInGet": 500, "maxObjectsInSet": 500, "maxCallsInRequest": 16,
+            "maxConcurrentRequests": 4, "maxConcurrentUpload": 4,
+            "maxSizeRequest": 10000000, "maxSizeUpload": 50000000
+        } },
+        "accounts": { "w": { "name": "alice",
+            "accountCapabilities": {
+                "urn:ietf:params:jmap:sieve": {},
+                "urn:ietf:params:jmap:blob": {}
+            } } }
+    })
+    .to_string()
+}
+
+/// The quarantine has to cover the whole archive, not just mail.
+///
+/// A Sieve script rides the very same de-duplicating upload path a message does,
+/// so an orphaned marker can shadow one exactly the same way — and while only the
+/// Email reconciler filed rows, this run printed `SieveScript: ... failed=1` and
+/// exited 5 while `inspect --failures` still reported `Export failures (0)`. A
+/// caller that reads "no rows" as "nothing was refused" called that clean.
+#[test]
+fn export_sieve_blob_not_found_surviving_reupload_is_quarantined_as_orphaned_marker() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    let script = b"require [\"fileinto\"];\nfileinto \"Archive\";\n";
+    {
+        let conn = db::init::open(&archive).unwrap();
+        let blob = db::blobs::intern_blob(&conn, script).unwrap();
+        conn.execute(
+            "INSERT INTO sieve_scripts (id,name,is_active,blob_id) VALUES (1,'orphaned',0,?1)",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_sieve_blob(&base))
+        .expect_at_least(1)
+        .create();
+    let _g = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("SieveScript/get".into()))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/get",
+                {"accountId":"w","list":[],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    // Identical bytes hash the same, so the re-upload is de-duplicated onto the
+    // same marker and comes back as the same blobId: the retry cannot help.
+    let up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP1"}).to_string())
+        .expect(2)
+        .create();
+    let create = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("SieveScript/set".into()),
+            Matcher::Regex("UP1".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/set",{"accountId":"w",
+                "notCreated":{"c1":{"type":"blobNotFound"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(2)
+        .create();
+    let probe = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Blob/get".into()),
+            Matcher::Regex("UP1".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Blob/get",
+                {"accountId":"w","list":[],"notFound":["UP1"]},"b"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _deactivate = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("onSuccessDeactivateScript".into()))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/set",{"accountId":"w"},"a"]]}).to_string(),
+        )
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::SieveScript]),
+    )
+    .expect("export run");
+
+    up.assert();
+    create.assert();
+    probe.assert();
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "SieveScript")
+        .map(|(_, c)| c.clone())
+        .expect("sieve counts");
+    assert_eq!(counts.failed, 1, "the refusal survived the re-upload");
+    assert!(summary.any_failed());
+
+    let rows = failures_in(&archive);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a failed=1 the caller cannot resolve to an item is the whole bug: {rows:?}"
+    );
+    assert_eq!(rows[0].type_name, "sievescript");
+    assert_eq!(rows[0].local_id, 1);
+    assert_eq!(rows[0].client_id, "c1");
+    assert_eq!(rows[0].error_type, "blobNotFound");
+    assert_eq!(rows[0].target_blob_id.as_deref(), Some("UP1"));
+    assert_eq!(
+        rows[0].blob_probe, "orphaned_marker",
+        "upload 200 plus Blob/get notFound is the orphaned dedup marker signature"
+    );
+    assert_eq!(
+        rows[0].size_bytes,
+        Some(script.len() as i64),
+        "the script's own bytes identify it"
+    );
+    assert_eq!(
+        rows[0].blob_hash.as_deref().map(str::len),
+        Some(64),
+        "the blake3 is the key the target de-duplicates on: {rows:?}"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+/// A type with no blob at all still has to leave a trace, or the table means
+/// "refused Email and blob-backed objects" rather than "refused".
+#[test]
+fn export_address_book_refusal_is_quarantined_and_cleared_once_it_lands() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO address_books (id,name,description,is_default)
+             VALUES (1,'Work',NULL,0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _g = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("AddressBook/get".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/get",
+                {"accountId":"w","list":[],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let refuse = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("AddressBook/set".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/set",{"accountId":"w",
+                "notCreated":{"c1":{"type":"forbidden","description":"quota exceeded"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::AddressBook]),
+    )
+    .expect("export run");
+    refuse.assert();
+    assert!(summary.any_failed());
+
+    let rows = failures_in(&archive);
+    assert_eq!(rows.len(), 1, "got {rows:?}");
+    assert_eq!(rows[0].type_name, "addressbook");
+    assert_eq!(rows[0].local_id, 1);
+    assert_eq!(rows[0].error_type, "forbidden");
+    assert!(
+        rows[0].error_detail.contains("quota exceeded"),
+        "the target's own words are what an operator acts on: {rows:?}"
+    );
+    assert_eq!(
+        rows[0].blob_probe, "not_probed",
+        "nothing here goes through the blob store, so nothing was probed"
+    );
+    assert_eq!(rows[0].blob_local_id, None);
+
+    // Second run: the book is on the target, so the row describes a failure that
+    // no longer holds and must not keep reporting itself as unresolved.
+    let mut server2 = mockito::Server::new();
+    let base2 = server2.url();
+    let _root2 = server2.mock("GET", "/").with_status(404).create();
+    let _wk2 = server2
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base2))
+        .expect_at_least(1)
+        .create();
+    let _g2 = server2
+        .mock("POST", api)
+        .match_body(Matcher::Regex("AddressBook/get".into()))
+        .with_body(
+            json!({"methodResponses":[["AddressBook/get",{"accountId":"w","list":[
+                {"id":"WID","name":"Work","isDefault":false,"myRights":{"mayDelete":true}}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+
+    let summary2 = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base2, vec![ObjectType::AddressBook]),
+    )
+    .expect("second export run");
+    assert!(!summary2.any_failed());
+    assert!(
+        failures_in(&archive).is_empty(),
+        "a resolved item must not stay quarantined"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+fn sieve_counts(summary: &sync::Summary) -> sync::TypeCounts {
+    summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "SieveScript")
+        .map(|(_, c)| c.clone())
+        .expect("sieve counts")
+}
+
+/// One script that will not go up must not take the rest of the surface with it.
+///
+/// The upload is the only fallible step in building a SieveScript create, and it
+/// used to leave the reconciler by `?`. That ended the WHOLE pass: `run()` caught
+/// it as `type SieveScript aborted`, charged the abort a single `failed` unit —
+/// with no row behind it, the blind spot the quarantine exists to close — and
+/// every script queued behind the broken one went unattempted while the count
+/// still said one. A caller reconciling `failed=N` against the archive would
+/// find neither the script that broke nor the ones that were never tried.
+#[test]
+fn export_sieve_upload_failure_quarantines_one_script_without_aborting_the_surface() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    let broken = b"require [\"fileinto\"];\nfileinto \"Archive\";\n";
+    let sound = b"keep;\n";
+    {
+        let conn = db::init::open(&archive).unwrap();
+        let b1 = db::blobs::intern_blob(&conn, broken).unwrap();
+        let b2 = db::blobs::intern_blob(&conn, sound).unwrap();
+        conn.execute(
+            "INSERT INTO sieve_scripts (id,name,is_active,blob_id) VALUES (1,'refused',0,?1)",
+            rusqlite::params![b1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sieve_scripts (id,name,is_active,blob_id) VALUES (2,'accepted',0,?1)",
+            rusqlite::params![b2],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_sieve_blob(&base))
+        .expect_at_least(1)
+        .create();
+    let _g = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("SieveScript/get".into()))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/get",
+                {"accountId":"w","list":[],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    // A 200 that names no blobId: the target took the bytes and told us nothing
+    // we can put in a create. Only the first script's upload answers this way.
+    let bad_upload = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .match_body(Matcher::Regex("fileinto".into()))
+        .with_body(json!({ "stored": true }).to_string())
+        .expect(1)
+        .create();
+    let good_upload = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .match_body(Matcher::Regex("keep;".into()))
+        .with_body(json!({ "blobId": "UP2" }).to_string())
+        .expect(1)
+        .create();
+    let create = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("SieveScript/set".into()),
+            Matcher::Regex("UP2".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/set",{"accountId":"w",
+                "created":{"c2":{"id":"S2"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _deactivate = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("onSuccessDeactivateScript".into()))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/set",{"accountId":"w"},"a"]]}).to_string(),
+        )
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::SieveScript]),
+    )
+    .expect("export run");
+
+    bad_upload.assert();
+    good_upload.assert();
+    create.assert();
+
+    let counts = sieve_counts(&summary);
+    assert_eq!(counts.failed, 1, "one script, not one aborted surface");
+    assert_eq!(
+        counts.created, 1,
+        "the script queued behind the broken one still has to be attempted"
+    );
+    assert!(summary.any_failed());
+
+    let rows = failures_in(&archive);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a failed=1 the caller cannot resolve to an item is the whole bug: {rows:?}"
+    );
+    assert_eq!(rows[0].type_name, "sievescript");
+    assert_eq!(rows[0].local_id, 1);
+    assert_eq!(rows[0].client_id, "c1");
+    assert_eq!(
+        rows[0].error_type, "blobUploadFailed",
+        "the same category the Email path records for bytes that would not go up"
+    );
+    assert!(
+        rows[0].error_detail.contains("blobId"),
+        "the row carries what the target actually did: {rows:?}"
+    );
+    assert_eq!(
+        rows[0].size_bytes,
+        Some(broken.len() as i64),
+        "the script's own bytes identify it even though the upload failed"
+    );
+    assert_eq!(
+        rows[0].blob_hash.as_deref().map(str::len),
+        Some(64),
+        "the blake3 is what correlates the item with the target's store: {rows:?}"
+    );
+    assert_eq!(
+        rows[0].blob_probe, "not_probed",
+        "nothing was uploaded, so there is no blobId to probe"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+/// A calendar that will not build is one item, not the whole calendar surface.
+///
+/// `default_alerts_with_time` is CHECKed for well-formed JSON but not for shape,
+/// so an archive can legitimately hold a value that passes SQLite and then fails
+/// to deserialize. That used to leave the reconciler by `?` and abort the type:
+/// every other calendar went uncreated and the abort was charged one `failed`
+/// unit with nothing in the quarantine to say which row was at fault.
+#[test]
+fn export_calendar_that_will_not_build_is_quarantined_without_aborting_the_surface() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id,name,default_alerts_with_time) VALUES (1,'Broken','[1,2,3]')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO calendars (id,name) VALUES (2,'Team')", [])
+            .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _g = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/get",
+                {"accountId":"w","list":[],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let create = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Calendar/set".into()),
+            Matcher::Regex("Team".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Calendar/set",{"accountId":"w",
+                "created":{"c2":{"id":"CID2"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Calendar]),
+    )
+    .expect("export run");
+    create.assert();
+
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Calendar")
+        .map(|(_, c)| c.clone())
+        .expect("calendar counts");
+    assert_eq!(counts.failed, 1, "one calendar, not one aborted surface");
+    assert_eq!(
+        counts.created, 1,
+        "the sound calendar still has to reach the target"
+    );
+
+    let rows = failures_in(&archive);
+    assert_eq!(rows.len(), 1, "got {rows:?}");
+    assert_eq!(rows[0].type_name, "calendar");
+    assert_eq!(rows[0].local_id, 1);
+    assert_eq!(rows[0].client_id, "c1");
+    assert_eq!(rows[0].error_type, "buildFailed");
+    assert_eq!(
+        rows[0].blob_local_id, None,
+        "a calendar carries no blob, so there is none to name"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+/// Merging onto a target object that is already there IS landing on the target,
+/// so the row a previous run left behind has to go with it.
+///
+/// This is the one landing `reap_missing` can never clean up after: the archive
+/// object is still present under the same local id, so the sweep correctly keeps
+/// the row, and the merge short-circuits before any `/set` call, so neither the
+/// `created` nor the `alreadyExists` branch is reached either. Left unresolved
+/// the row is a permanent phantom — `inspect --failures` keeps naming a mailbox
+/// that migrated fine, and a caller gating on "rows present == still unresolved"
+/// can never be cleared.
+#[test]
+fn export_mailbox_merged_onto_a_name_collision_clears_its_quarantine_row() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        // Two archive folders folding to the same name: the first is matched by
+        // the name pre-pass and claims the target, so the second can only reach
+        // it through `find_name_collision`.
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Work',NULL,NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (2,'work',NULL,NULL)",
+            [],
+        )
+        .unwrap();
+        let mut row = stale_row("mailbox", 2);
+        row.error_type = "forbidden".to_owned();
+        row.error_detail = "refused by an earlier run".to_owned();
+        row.blob_local_id = None;
+        row.blob_probe = db::export_failures::PROBE_NOT_PROBED.to_owned();
+        db::export_failures::record(&conn, &row).unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .expect_at_least(1)
+        .create();
+    let _term = anchor_terminator(&mut server, api, "Mailbox");
+    let _q = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+                {"accountId":"w","ids":["t1"]},"q"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _g = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
+                {"id":"t1","name":"Work","role":null,"parentId":null,
+                 "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    // No Mailbox/set is registered on purpose: both locals resolve to the target
+    // that is already there, so a create attempt would fail the run outright.
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Mailbox]),
+    )
+    .expect("export run");
+
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Mailbox")
+        .map(|(_, c)| c.clone())
+        .expect("mailbox counts");
+    assert_eq!(counts.created, 0);
+    assert_eq!(counts.failed, 0);
+    assert_eq!(counts.skipped, 2, "one matched, one merged");
+    assert!(!summary.any_failed());
+
+    assert!(
+        failures_in(&archive).is_empty(),
+        "the merged folder is on the target; a row still naming it is a phantom \
+         failure nothing else in the lifecycle can ever clear"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}

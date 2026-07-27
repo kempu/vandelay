@@ -358,6 +358,23 @@ struct InspectArgs {
     )]
     target: Option<String>,
 
+    // `--failed-items` is the spelling the control plane driving a migration
+    // calls, and it is the one pinned in that caller's code; `--failures` is the
+    // spelling this CLI documented first. Both name the same dump, so they are
+    // one flag with an alias rather than two arguments that could disagree.
+    #[arg(
+        long,
+        visible_alias = "failed-items",
+        help = "Dump the per-item export failures recorded by the last export"
+    )]
+    failures: bool,
+
+    #[arg(
+        long,
+        help = "Emit the failure dump as a single JSON object instead of columns"
+    )]
+    json: bool,
+
     #[arg(
         long,
         value_name = "N",
@@ -879,6 +896,21 @@ fn resolve_inspect(args: InspectArgs) -> Result<Action, Error> {
         Some(token) => Some(ObjectType::parse(token)?),
         None => None,
     };
+    if args.failures && target.is_some() {
+        return Err(Error::Usage(
+            "--failures dumps the export quarantine and cannot be combined with a TYPE".to_owned(),
+        ));
+    }
+    // Rejected rather than ignored: a caller that asked for JSON and got the
+    // columnar dump would either parse nothing out of it or, worse, parse
+    // something wrong out of it, and either way it would have been told nothing
+    // about the mode it did not get.
+    if args.json && !args.failures {
+        return Err(Error::Usage(
+            "--json only applies to the export quarantine dump (--failed-items/--failures)"
+                .to_owned(),
+        ));
+    }
     if let Some(limit) = args.limit
         && limit == 0
     {
@@ -887,6 +919,8 @@ fn resolve_inspect(args: InspectArgs) -> Result<Action, Error> {
     Ok(Action::Inspect(InspectConfig {
         archive: args.archive,
         target,
+        failures: args.failures,
+        json: args.json,
         limit: args.limit,
         offset: args.offset,
     }))
@@ -1385,5 +1419,53 @@ mod tests {
         let bearer: Option<String> = Some("t".to_owned());
         let auth = resolve_auth(None, None, Some(&bearer)).unwrap();
         assert!(matches!(auth, Auth::Bearer { token } if token == "t"));
+    }
+
+    fn inspect(argv: &[&str]) -> Result<InspectConfig, Error> {
+        match Cli::try_parse_from(argv)
+            .expect("clap rejected the argv")
+            .resolve()?
+        {
+            Action::Inspect(config) => Ok(config),
+            _ => panic!("expected an Inspect action"),
+        }
+    }
+
+    // The exact argv the control plane driving a migration spawns. It is pinned
+    // in that caller's code and it is deployed independently of this binary, so
+    // it is asserted verbatim rather than paraphrased.
+    #[test]
+    fn failed_items_json_is_the_argv_the_control_plane_spawns() {
+        let config = inspect(&[
+            "vandelay",
+            "inspect",
+            "--failed-items",
+            "--json",
+            "/tmp/archive.sqlite3",
+        ])
+        .unwrap();
+        assert!(config.failures);
+        assert!(config.json);
+        assert!(config.target.is_none());
+        assert_eq!(config.archive, PathBuf::from("/tmp/archive.sqlite3"));
+    }
+
+    #[test]
+    fn failed_items_is_an_alias_of_failures_not_a_second_flag() {
+        let aliased = inspect(&["vandelay", "inspect", "--failed-items", "a.sqlite3"]).unwrap();
+        let original = inspect(&["vandelay", "inspect", "--failures", "a.sqlite3"]).unwrap();
+        assert!(aliased.failures && original.failures);
+        assert!(!aliased.json && !original.json);
+    }
+
+    // Silently rendering columns for a caller that asked for JSON would hand it
+    // a body it cannot parse, with nothing anywhere saying why.
+    #[test]
+    fn json_without_the_failure_dump_is_a_usage_error() {
+        match inspect(&["vandelay", "inspect", "--json", "a.sqlite3"]) {
+            Err(Error::Usage(m)) => assert!(m.contains("--json"), "msg was: {m}"),
+            Err(other) => panic!("expected a Usage error, got {other:?}"),
+            Ok(_) => panic!("--json without the failure dump must not resolve"),
+        }
     }
 }

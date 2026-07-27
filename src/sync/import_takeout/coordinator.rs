@@ -182,6 +182,7 @@ pub fn run(common: CommonConfig, config: TakeoutImportConfig) -> Result<Summary,
         ],
         retries_observed: 0,
         retry_after_sleeps: 0,
+        ..Default::default()
     })
 }
 
@@ -335,6 +336,7 @@ fn dry_run_summary(
         ],
         retries_observed: 0,
         retry_after_sleeps: 0,
+        ..Default::default()
     }
 }
 

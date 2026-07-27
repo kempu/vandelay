@@ -78,8 +78,19 @@ fn run() -> i32 {
     match result {
         Ok((summary, logger)) => {
             report(&summary);
+            // Reported apart from `failed=N` above, and with its own exit path:
+            // a per-item record that could not be written is not an object the
+            // target refused and must not be counted as one (see
+            // Summary::unrecorded_failures), yet it cannot leave the run looking
+            // clean either — the counters just printed are no longer fully backed
+            // by what the archive holds.
+            for detail in &summary.unrecorded_failures {
+                logger.error(detail);
+            }
             if summary.any_failed() {
                 logger.error("some objects failed; the archive is consistent and resumable");
+                5
+            } else if !summary.unrecorded_failures.is_empty() {
                 5
             } else {
                 0

@@ -254,3 +254,24 @@ CREATE TABLE IF NOT EXISTS sync_id_takeout (
 
 CREATE INDEX IF NOT EXISTS sync_id_takeout_type_idx
     ON sync_id_takeout (source_id, type_name);
+
+CREATE TABLE IF NOT EXISTS export_failures (
+    type_name       TEXT    NOT NULL,
+    local_id        INTEGER NOT NULL,
+    client_id       TEXT    NOT NULL,
+    message_id      TEXT,
+    size_bytes      INTEGER,
+    blob_local_id   INTEGER,
+    blob_hash       TEXT,
+    target_blob_id  TEXT,
+    error_type      TEXT    NOT NULL,
+    error_detail    TEXT    NOT NULL,
+    blob_probe      TEXT    NOT NULL DEFAULT 'not_probed'
+                            CHECK (blob_probe IN ('not_probed','retrievable','orphaned_marker',
+                                                  'store_unavailable','unsupported')),
+    failed_at       TEXT    NOT NULL,
+    PRIMARY KEY (type_name, local_id)
+);
+
+CREATE INDEX IF NOT EXISTS export_failures_failed_at_idx
+    ON export_failures (failed_at);

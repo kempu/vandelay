@@ -193,7 +193,11 @@ fn bool_str(b: bool) -> String {
     (if b { "true" } else { "false" }).to_owned()
 }
 
-fn write_record(out: &mut impl Write, title: &str, fields: &[(&str, String)]) -> Result<(), Error> {
+pub(super) fn write_record(
+    out: &mut impl Write,
+    title: &str,
+    fields: &[(&str, String)],
+) -> Result<(), Error> {
     writeln!(out, "{title}")?;
     let max_label = fields.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
     let pad = " ".repeat(max_label + 4);

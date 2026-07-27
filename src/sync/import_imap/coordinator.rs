@@ -428,6 +428,7 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
         per_type: vec![("mailbox", mailbox_counts), ("email", email_counts)],
         retries_observed: backoff.total_retries(),
         retry_after_sleeps: backoff.transient_retries() as u64,
+        ..Default::default()
     })
 }
 
@@ -1198,6 +1199,7 @@ fn dry_run_summary(
         per_type: vec![("mailbox", mailbox), ("email", email)],
         retries_observed: control_ctx.backoff.total_retries(),
         retry_after_sleeps: control_ctx.backoff.transient_retries() as u64,
+        ..Default::default()
     })
 }
 

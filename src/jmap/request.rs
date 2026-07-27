@@ -14,10 +14,12 @@ use crate::jmap::session::Limits;
 use crate::jmap::wire::JmapId;
 
 pub const URN_CORE: &str = "urn:ietf:params:jmap:core";
+pub const URN_BLOB: &str = "urn:ietf:params:jmap:blob";
 
 pub fn using_urn(method: &str) -> &'static str {
     let prefix = method.split('/').next().unwrap_or(method);
     match prefix {
+        "Blob" => URN_BLOB,
         "Mailbox" | "Email" => "urn:ietf:params:jmap:mail",
         "Identity" => "urn:ietf:params:jmap:submission",
         "SieveScript" => "urn:ietf:params:jmap:sieve",

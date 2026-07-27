@@ -211,6 +211,7 @@ pub fn run(common: CommonConfig, config: MaildirImportConfig) -> Result<Summary,
         per_type: vec![("mailbox", mailbox_counts), ("email", email_counts)],
         retries_observed: 0,
         retry_after_sleeps: 0,
+        ..Default::default()
     })
 }
 
@@ -467,6 +468,7 @@ fn build_dry_run_summary(
         per_type: vec![("mailbox", mailbox), ("email", email)],
         retries_observed: 0,
         retry_after_sleeps: 0,
+        ..Default::default()
     })
 }
 

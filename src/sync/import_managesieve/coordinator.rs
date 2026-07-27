@@ -330,6 +330,7 @@ pub fn run(common: CommonConfig, config: ManageSieveImportConfig) -> Result<Summ
         per_type: vec![("sievescript", counts)],
         retries_observed: backoff.total_retries(),
         retry_after_sleeps: backoff.transient_retries() as u64,
+        ..Default::default()
     })
 }
 
@@ -374,6 +375,7 @@ fn build_dry_run_summary(
         per_type: vec![("sievescript", counts)],
         retries_observed: backoff.total_retries(),
         retry_after_sleeps: backoff.transient_retries() as u64,
+        ..Default::default()
     })
 }
 

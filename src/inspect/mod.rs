@@ -14,12 +14,22 @@ use crate::db::init;
 use crate::error::Error;
 use crate::types::ObjectType;
 
+pub mod failures;
 pub mod list;
 pub mod tree;
 
 pub struct InspectConfig {
     pub archive: PathBuf,
     pub target: Option<ObjectType>,
+    /// Dump the per-item export quarantine instead of an object type. It is not
+    /// an `ObjectType` variant on purpose: `ObjectType::ALL` also drives which
+    /// tables `export` walks, and a synthetic member would make export try to
+    /// push the failure table at the target.
+    pub failures: bool,
+    /// Emit the quarantine as one machine-readable JSON object instead of the
+    /// columnar dump. Only meaningful together with `failures`; the CLI rejects
+    /// the combination that is not.
+    pub json: bool,
     pub limit: Option<usize>,
     pub offset: usize,
 }
@@ -33,6 +43,13 @@ pub fn run(config: InspectConfig) -> Result<(), Error> {
 }
 
 fn dispatch(conn: &Connection, cfg: &InspectConfig, out: &mut impl Write) -> Result<(), Error> {
+    if cfg.failures {
+        return if cfg.json {
+            failures::write_failures_json(conn, cfg.limit, cfg.offset, out)
+        } else {
+            failures::write_failures(conn, cfg.limit, cfg.offset, out)
+        };
+    }
     match cfg.target {
         None => write_summary(conn, &cfg.archive, out),
         Some(ObjectType::Mailbox) => {
@@ -102,6 +119,17 @@ fn write_summary(conn: &Connection, archive: &Path, out: &mut impl Write) -> Res
         "blobs",
         format_count(blob_count),
         format_bytes(blob_bytes),
+        lw = label_width,
+        cw = count_width
+    )?;
+    // Without this line the quarantine is invisible to anyone who does not
+    // already know to ask for it, which defeats the point of recording it.
+    let failed = crate::db::export_failures::count(conn)?;
+    writeln!(
+        out,
+        "  {:<lw$}  {:>cw$}  (vandelay inspect <archive> --failures)",
+        "failures",
+        format_count(failed),
         lw = label_width,
         cw = count_width
     )?;
