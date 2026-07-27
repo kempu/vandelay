@@ -9,7 +9,11 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Map, Value, json};
 
 use super::common::{jid, target_query_get};
-use super::{Maps, Net, Plan, Uploader};
+use super::{
+    Maps, Net, Plan, Quarantine, Uploader, blob_identity, classify_blob, dedup_note,
+    normalise_error_type, probe_note,
+};
+use crate::db::export_failures::{self, FailedItem, PROBE_NOT_PROBED};
 use crate::error::Error;
 use crate::jmap::error::JmapError;
 use crate::jmap::request::{Request, check_method_error, get_objects};
@@ -55,6 +59,7 @@ pub fn reconcile(
     maps: &mut Maps,
     counts: &mut TypeCounts,
     logger: &Logger,
+    unrecorded: &mut Vec<String>,
 ) -> Result<Plan, Error> {
     let ty = ObjectType::Email;
 
@@ -114,13 +119,32 @@ pub fn reconcile(
     let local_keys = email_keys(&local_indices);
 
     let mut uploader = Uploader::new(net, &ctx.conn);
+    let mut quarantine = Quarantine::open(&ctx.conn, ty, net.dry_run)?;
     for (i, key) in local_keys.iter().enumerate() {
+        let (local_id, row) = &local[i];
         if target_keys.contains(key) {
             counts.skipped += 1;
+            // The message is on the target now, so any quarantine row a previous
+            // run left behind describes a failure that has since been resolved.
+            quarantine.resolve(*local_id, logger);
             continue;
         }
-        let (local_id, row) = &local[i];
-        export_one(net, &mut uploader, maps, *local_id, row, counts, logger);
+        export_one(
+            net,
+            &mut uploader,
+            maps,
+            *local_id,
+            row,
+            counts,
+            logger,
+            &mut quarantine,
+        );
+    }
+    // Not `?`: the pass above completed and its counters are sound, so a failure
+    // to write the sidecar rows travels as its own signal rather than as an
+    // error that `run()` would charge to `failed`. See `Quarantine::finish`.
+    if let Some(e) = quarantine.finish() {
+        unrecorded.push(e);
     }
 
     Ok(Plan::default())
@@ -144,14 +168,24 @@ fn build_keywords(row: &EmailRow) -> Map<String, Value> {
 }
 
 fn blob_hint(uploader: &Uploader, row: &EmailRow) -> String {
+    use std::fmt::Write;
+
     let idx = index_from_json(&row.message_match);
     let mut s = match idx.mids.first() {
         Some(mid) => format!("message-id <{mid}>"),
         None => "no message-id".to_owned(),
     };
-    if let Some(len) = uploader.blob_len(row.blob_local_id) {
-        use std::fmt::Write;
-        let _ = write!(s, ", {}", crate::inspect::format_bytes(len));
+    match uploader.blob_len(row.blob_local_id) {
+        Ok(Some(len)) => {
+            let _ = write!(s, ", {}", crate::inspect::format_bytes(len));
+        }
+        Ok(None) => {}
+        // The hint is decoration on a warning that is already being printed, so
+        // it must not turn a failed archive read into a silently size-less line
+        // that reads exactly like a message whose bytes are gone.
+        Err(e) => {
+            let _ = write!(s, ", size unreadable: {e}");
+        }
     }
     s
 }
@@ -181,6 +215,49 @@ fn import_item(
     })
 }
 
+/// Build the structured counterpart of the human-readable warning.
+///
+/// The warnings on stderr are for an operator watching the run; this row is for
+/// whatever automation drives it, which previously could only read the aggregate
+/// `failed=N` and had no way to say WHICH messages were refused. The full blake3
+/// of the message bytes goes in deliberately: on a content-addressed target it
+/// is the key the server itself de-duplicates on, so it is what correlates a
+/// quarantined item with the marker sitting in the target's metadata store.
+fn failed_item(
+    uploader: &Uploader,
+    cid: &str,
+    local_id: i64,
+    row: &EmailRow,
+    error_type: &str,
+    error_detail: String,
+    logger: &Logger,
+) -> FailedItem {
+    let idx = index_from_json(&row.message_match);
+    let blob = blob_identity(
+        uploader.blob_len(row.blob_local_id),
+        uploader.blob_hash(row.blob_local_id),
+        ObjectType::Email,
+        row.blob_local_id,
+        logger,
+    );
+    let error_detail = blob.annotate(error_detail);
+    FailedItem {
+        type_name: ObjectType::Email.token().to_owned(),
+        local_id,
+        client_id: cid.to_owned(),
+        message_id: idx.mids.first().cloned(),
+        size_bytes: blob.size_bytes,
+        blob_local_id: Some(row.blob_local_id),
+        blob_hash: blob.hash,
+        target_blob_id: None,
+        error_type: normalise_error_type(error_type),
+        error_detail,
+        blob_probe: PROBE_NOT_PROBED.to_owned(),
+        failed_at: export_failures::stamp_now(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn export_one(
     net: &Net,
     uploader: &mut Uploader,
@@ -189,6 +266,7 @@ fn export_one(
     row: &EmailRow,
     counts: &mut TypeCounts,
     logger: &Logger,
+    quarantine: &mut Quarantine,
 ) {
     let cid = format!("e{local_id}");
     let mids = match build_mailbox_ids(row, maps) {
@@ -198,6 +276,18 @@ fn export_one(
                 "Email/import {cid} ({}) skipped: mailbox not on target",
                 blob_hint(uploader, row)
             ));
+            quarantine.record(
+                failed_item(
+                    uploader,
+                    &cid,
+                    local_id,
+                    row,
+                    "mailboxNotOnTarget",
+                    "the mailbox holding this message was not created on the target".to_owned(),
+                    logger,
+                ),
+                logger,
+            );
             counts.failed += 1;
             return;
         }
@@ -210,6 +300,18 @@ fn export_one(
                 blob_hint(uploader, row),
                 size_note(&e)
             ));
+            quarantine.record(
+                failed_item(
+                    uploader,
+                    &cid,
+                    local_id,
+                    row,
+                    "blobUploadFailed",
+                    format!("{e}{}", size_note(&e)),
+                    logger,
+                ),
+                logger,
+            );
             counts.failed += 1;
             return;
         }
@@ -218,18 +320,29 @@ fn export_one(
         counts.created += 1;
         return;
     }
-    let item = import_item(blob, mids, build_keywords(row), &row.received_at);
+    let item = import_item(blob.clone(), mids, build_keywords(row), &row.received_at);
     match send_single_import(net, &cid, item) {
-        Ok(SingleImport::Created) => counts.created += 1,
-        Ok(SingleImport::Skipped) => counts.skipped += 1,
-        Ok(SingleImport::NotCreated { error_type, .. }) if error_type == "blobNotFound" => {
-            retry_after_reupload(net, uploader, maps, &cid, row, counts, logger);
+        Ok(SingleImport::Created) => {
+            counts.created += 1;
+            quarantine.resolve(local_id, logger);
         }
-        Ok(SingleImport::NotCreated { detail, .. }) => {
+        Ok(SingleImport::Skipped) => {
+            counts.skipped += 1;
+            quarantine.resolve(local_id, logger);
+        }
+        Ok(SingleImport::NotCreated { error_type, .. }) if error_type == "blobNotFound" => {
+            retry_after_reupload(
+                net, uploader, maps, &cid, local_id, row, &blob, counts, logger, quarantine,
+            );
+        }
+        Ok(SingleImport::NotCreated { error_type, detail }) => {
             logger.warn(&format!(
                 "Email/import {cid} ({}) failed: {detail}",
                 blob_hint(uploader, row)
             ));
+            let mut item = failed_item(uploader, &cid, local_id, row, &error_type, detail, logger);
+            item.target_blob_id = Some(blob);
+            quarantine.record(item, logger);
             counts.failed += 1;
         }
         Err(e) => {
@@ -238,19 +351,34 @@ fn export_one(
                 blob_hint(uploader, row),
                 size_note(&e)
             ));
+            let mut item = failed_item(
+                uploader,
+                &cid,
+                local_id,
+                row,
+                "sendFailed",
+                format!("{e}{}", size_note(&e)),
+                logger,
+            );
+            item.target_blob_id = Some(blob);
+            quarantine.record(item, logger);
             counts.failed += 1;
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn retry_after_reupload(
     net: &Net,
     uploader: &mut Uploader,
     maps: &Maps,
     cid: &str,
+    local_id: i64,
     row: &EmailRow,
+    first_blob: &str,
     counts: &mut TypeCounts,
     logger: &Logger,
+    quarantine: &mut Quarantine,
 ) {
     uploader.invalidate(row.blob_local_id);
     let blob = match uploader.upload_with(row.blob_local_id, "message/rfc822") {
@@ -261,6 +389,17 @@ fn retry_after_reupload(
                 blob_hint(uploader, row),
                 size_note(&e)
             ));
+            let mut item = failed_item(
+                uploader,
+                cid,
+                local_id,
+                row,
+                "blobUploadFailed",
+                format!("re-upload after blobNotFound: {e}{}", size_note(&e)),
+                logger,
+            );
+            item.target_blob_id = Some(first_blob.to_owned());
+            quarantine.record(item, logger);
             counts.failed += 1;
             return;
         }
@@ -272,19 +411,64 @@ fn retry_after_reupload(
                 "Email/import {cid} ({}) skipped: mailbox not on target",
                 blob_hint(uploader, row)
             ));
+            let mut item = failed_item(
+                uploader,
+                cid,
+                local_id,
+                row,
+                "mailboxNotOnTarget",
+                "the mailbox holding this message was not created on the target".to_owned(),
+                logger,
+            );
+            item.target_blob_id = Some(blob);
+            quarantine.record(item, logger);
             counts.failed += 1;
             return;
         }
     };
-    let item = import_item(blob, mids, build_keywords(row), &row.received_at);
+    let item = import_item(blob.clone(), mids, build_keywords(row), &row.received_at);
     match send_single_import(net, cid, item) {
-        Ok(SingleImport::Created) => counts.created += 1,
-        Ok(SingleImport::Skipped) => counts.skipped += 1,
-        Ok(SingleImport::NotCreated { detail, .. }) => {
+        Ok(SingleImport::Created) => {
+            counts.created += 1;
+            quarantine.resolve(local_id, logger);
+        }
+        Ok(SingleImport::Skipped) => {
+            counts.skipped += 1;
+            quarantine.resolve(local_id, logger);
+        }
+        Ok(SingleImport::NotCreated { error_type, detail }) if error_type == "blobNotFound" => {
+            let (probe, probe_detail) = classify_blob(net, &blob);
+            let dedup = dedup_note(first_blob, &blob);
+            logger.warn(&format!(
+                "Email/import {cid} ({}) failed after blob re-upload: {detail}{dedup}{}",
+                blob_hint(uploader, row),
+                probe_note(&probe)
+            ));
+            let mut item = failed_item(
+                uploader,
+                cid,
+                local_id,
+                row,
+                &error_type,
+                match &probe_detail {
+                    Some(text) => format!("{detail}; blob probe: {text}"),
+                    None => detail,
+                },
+                logger,
+            );
+            item.target_blob_id = Some(blob);
+            item.blob_probe = probe;
+            quarantine.record(item, logger);
+            counts.failed += 1;
+        }
+        Ok(SingleImport::NotCreated { error_type, detail }) => {
             logger.warn(&format!(
                 "Email/import {cid} ({}) failed after blob re-upload: {detail}",
                 blob_hint(uploader, row)
             ));
+            let mut item = failed_item(uploader, cid, local_id, row, &error_type, detail, logger);
+            item.target_blob_id = Some(blob);
+            quarantine.record(item, logger);
             counts.failed += 1;
         }
         Err(e) => {
@@ -293,6 +477,17 @@ fn retry_after_reupload(
                 blob_hint(uploader, row),
                 size_note(&e)
             ));
+            let mut item = failed_item(
+                uploader,
+                cid,
+                local_id,
+                row,
+                "sendFailed",
+                format!("after blob re-upload: {e}{}", size_note(&e)),
+                logger,
+            );
+            item.target_blob_id = Some(blob);
+            quarantine.record(item, logger);
             counts.failed += 1;
         }
     }

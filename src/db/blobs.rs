@@ -39,12 +39,32 @@ pub fn blob_len(conn: &Connection, id: i64) -> Result<Option<u64>, rusqlite::Err
     .optional()
 }
 
+pub fn blob_hash_hex(conn: &Connection, id: i64) -> Result<Option<String>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT lower(hex(hash)) FROM blobs WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+// `export_failures` is part of the reachability set on purpose. A quarantined
+// item's bytes are frequently the last surviving copy of a message the target
+// refused, and every importer that calls this GC sweeps the WHOLE blobs table,
+// not just the rows it has just written; without that arm the next importer to
+// run it would reap exactly the bytes the quarantine exists to keep.
+// The `IS NOT NULL` guard is load-bearing rather than cosmetic: the column is
+// nullable, so the first quarantined object type with no archived body to pin
+// would store NULL there, and one NULL inside a `NOT IN` subquery makes the
+// predicate unknown for every row, silently turning this DELETE into a
+// permanent no-op instead of an error.
 pub fn gc_orphan_blobs(conn: &Connection) -> Result<usize, rusqlite::Error> {
     conn.execute(
         "DELETE FROM blobs WHERE id NOT IN (
              SELECT blob_id FROM emails
              UNION SELECT blob_id FROM sieve_scripts
              UNION SELECT blob_id FROM file_nodes WHERE blob_id IS NOT NULL
+             UNION SELECT blob_local_id FROM export_failures WHERE blob_local_id IS NOT NULL
              UNION SELECT json_tree.atom FROM contact_cards, json_tree(contact_cards.data)
                    WHERE json_tree.key = '@blob'
              UNION SELECT json_tree.atom FROM calendar_events, json_tree(calendar_events.data)
@@ -111,6 +131,47 @@ mod tests {
         let removed = gc_orphan_blobs(&c).unwrap();
         assert_eq!(removed, 1);
         assert!(blob_bytes(&c, referenced).unwrap().is_some());
+    }
+
+    #[test]
+    fn gc_keeps_blobs_referenced_only_by_a_quarantined_item() {
+        let c = mem();
+        let quarantined = intern_blob(&c, b"refused by target").unwrap();
+        let _orphan = intern_blob(&c, b"reap me").unwrap();
+        crate::db::export_failures::record(
+            &c,
+            &crate::db::export_failures::FailedItem {
+                type_name: "email".to_owned(),
+                local_id: 1,
+                client_id: "e1".to_owned(),
+                message_id: None,
+                size_bytes: None,
+                blob_local_id: Some(quarantined),
+                blob_hash: None,
+                target_blob_id: None,
+                error_type: "blobNotFound".to_owned(),
+                error_detail: "{}".to_owned(),
+                blob_probe: crate::db::export_failures::PROBE_ORPHANED_MARKER.to_owned(),
+                failed_at: "2026-01-01T00:00:00Z".to_owned(),
+            },
+        )
+        .unwrap();
+        let removed = gc_orphan_blobs(&c).unwrap();
+        assert_eq!(removed, 1);
+        assert!(
+            blob_bytes(&c, quarantined).unwrap().is_some(),
+            "quarantined bytes are the last copy and must survive gc"
+        );
+    }
+
+    #[test]
+    fn blob_hash_hex_returns_the_full_blake3_digest() {
+        let c = mem();
+        let id = intern_blob(&c, b"hello world").unwrap();
+        let hex = blob_hash_hex(&c, id).unwrap().unwrap();
+        assert_eq!(hex.len(), 64, "got {hex}");
+        assert_eq!(hex, blake3::hash(b"hello world").to_hex().to_string());
+        assert_eq!(blob_hash_hex(&c, 9999).unwrap(), None);
     }
 
     #[test]

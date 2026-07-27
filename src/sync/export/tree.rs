@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::params;
 use serde_json::Value;
 
-use super::common::{create_batch, jid, retry_if_blob_missing, target_query_get};
-use super::{Net, Plan, Uploader};
+use super::common::{create_batch, jid, retry_if_blob_missing, sole_blob, target_query_get};
+use super::{Net, Plan, Quarantine, Uploader};
 use crate::error::Error;
 use crate::jmap::wire::JmapId;
 use crate::logging::Logger;
@@ -138,6 +138,7 @@ pub fn reconcile(
     maps: &mut Maps,
     counts: &mut TypeCounts,
     logger: &Logger,
+    unrecorded: &mut Vec<String>,
 ) -> Result<Plan, Error> {
     let locals = load_local(ctx, ty)?;
     let targets = load_target(net, ty)?;
@@ -180,8 +181,12 @@ pub fn reconcile(
         }
     }
 
+    let mut quarantine = Quarantine::open(&ctx.conn, ty, net.dry_run)?;
     for (l, tid) in &matched {
         maps.insert(ty, *l, JmapId(tid.clone()));
+        // It is on the target now, so any quarantine row a previous run left
+        // behind describes a failure that has since been resolved.
+        quarantine.resolve(*l, logger);
     }
     counts.skipped += matched.len() as u64;
 
@@ -219,6 +224,14 @@ pub fn reconcile(
                                 n.local,
                                 p
                             ));
+                            quarantine.record_local_failure(
+                                n.local,
+                                &format!("c{}", n.local),
+                                None,
+                                "parentNotOnTarget",
+                                format!("parent local {p} was not created on the target"),
+                                logger,
+                            );
                             counts.failed += 1;
                             continue;
                         }
@@ -236,6 +249,15 @@ pub fn reconcile(
                         logger,
                     );
                     counts.skipped += 1;
+                    // Merged onto an object that is already there, so this node
+                    // IS on the target — exactly as much as one we created. A
+                    // row a previous run left for it describes a failure that no
+                    // longer holds, and nothing else would ever clear it: the
+                    // merge short-circuits before any create, so neither the
+                    // `created` nor the `alreadyExists` branch below is reached,
+                    // and `reap_missing` only takes rows whose archive object is
+                    // gone — this one is still right there.
+                    quarantine.resolve(n.local, logger);
                     continue;
                 }
                 let cid = format!("c{}", n.local);
@@ -248,6 +270,14 @@ pub fn reconcile(
                             ty.jmap_name(),
                             n.local
                         ));
+                        quarantine.record_local_failure(
+                            n.local,
+                            &cid,
+                            None,
+                            "buildFailed",
+                            e.to_string(),
+                            logger,
+                        );
                         counts.failed += 1;
                         continue;
                     }
@@ -255,12 +285,12 @@ pub fn reconcile(
                 let touched = uploader.take_touched();
                 let outcome =
                     create_batch(net, ty, vec![(cid.clone(), obj)]).map_err(Error::from)?;
-                let outcome = match retry_if_blob_missing(
+                let (outcome, retry) = match retry_if_blob_missing(
                     net,
                     ty,
                     &cid,
                     &mut uploader,
-                    touched,
+                    &touched,
                     outcome,
                     |up| build_create(ctx, ty, n.local, maps, up),
                 ) {
@@ -271,6 +301,14 @@ pub fn reconcile(
                             ty.jmap_name(),
                             n.local
                         ));
+                        quarantine.record_local_failure(
+                            n.local,
+                            &cid,
+                            sole_blob(&touched),
+                            "buildFailed",
+                            format!("rebuilding after blobNotFound: {e}"),
+                            logger,
+                        );
                         counts.failed += 1;
                         continue;
                     }
@@ -281,6 +319,7 @@ pub fn reconcile(
                     {
                         maps.insert(ty, local, JmapId(id));
                         counts.created += 1;
+                        quarantine.resolve(local, logger);
                     }
                 }
                 for (cid, err) in &outcome.not_created {
@@ -296,9 +335,29 @@ pub fn reconcile(
                             logger,
                         );
                         counts.skipped += 1;
+                        quarantine.resolve(local, logger);
                         continue;
                     }
-                    logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()));
+                    match local {
+                        // A file node carries its content as a blob, so `retry`
+                        // holds the same de-duplication evidence a message does.
+                        Some(local) => quarantine.record_refusal(
+                            net,
+                            local,
+                            cid,
+                            sole_blob(&touched),
+                            Some(err),
+                            retry.as_ref(),
+                            logger,
+                        ),
+                        // The target answered with a creation id we never sent,
+                        // so there is no archive object to key a quarantine row
+                        // on. Report it as it stands rather than filing it
+                        // against a guessed-at id.
+                        None => {
+                            logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()))
+                        }
+                    }
                     counts.failed += 1;
                 }
             }
@@ -317,6 +376,14 @@ pub fn reconcile(
                             n.local,
                             p
                         ));
+                        quarantine.record_local_failure(
+                            n.local,
+                            &format!("c{}", n.local),
+                            None,
+                            "parentNotOnTarget",
+                            format!("parent local {p} was not created on the target"),
+                            logger,
+                        );
                         counts.failed += 1;
                         continue;
                     }
@@ -333,6 +400,9 @@ pub fn reconcile(
                     logger,
                 );
                 counts.skipped += 1;
+                // See the interleaved branch above: a merge is a landing, so the
+                // row a previous run left for this node goes with it.
+                quarantine.resolve(n.local, logger);
                 continue;
             }
             match build_create(ctx, ty, n.local, maps, &mut uploader) {
@@ -360,6 +430,14 @@ pub fn reconcile(
                         ty.jmap_name(),
                         n.local
                     ));
+                    quarantine.record_local_failure(
+                        n.local,
+                        &format!("c{}", n.local),
+                        None,
+                        "buildFailed",
+                        e.to_string(),
+                        logger,
+                    );
                     counts.failed += 1;
                 }
             }
@@ -374,6 +452,7 @@ pub fn reconcile(
             {
                 maps.insert(ty, local, JmapId(id));
                 counts.created += 1;
+                quarantine.resolve(local, logger);
             }
         }
         for (cid, err) in &outcome.not_created {
@@ -389,9 +468,21 @@ pub fn reconcile(
                     logger,
                 );
                 counts.skipped += 1;
+                quarantine.resolve(local, logger);
                 continue;
             }
-            logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()));
+            match local {
+                // This path batches, so no single blob can be attributed to one
+                // creation id; only the mailbox tree comes through here and it
+                // carries no blob at all.
+                Some(local) => {
+                    quarantine.record_refusal(net, local, cid, None, Some(err), None, logger)
+                }
+                // The target answered with a creation id we never sent, so there
+                // is no archive object to key a quarantine row on. Report it as
+                // it stands rather than filing it against a guessed-at id.
+                None => logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name())),
+            }
             counts.failed += 1;
         }
     }
@@ -406,6 +497,12 @@ pub fn reconcile(
             parent: t.parent.clone(),
         })
         .collect();
+    // Not `?`: the pass above completed and its counters are sound, so a failure
+    // to write the sidecar rows travels as its own signal rather than as an error
+    // that `run()` would charge to `failed`. See `Quarantine::finish`.
+    if let Some(e) = quarantine.finish() {
+        unrecorded.push(e);
+    }
     Ok(Plan {
         prune_candidates: crate::sync::prune::candidates(&objs, true),
         active_sieve_target: None,

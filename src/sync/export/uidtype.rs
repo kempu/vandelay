@@ -8,8 +8,8 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use super::common::{create_batch, jid, retry_if_blob_missing, target_query_get};
-use super::{Maps, Net, Plan, Uploader};
+use super::common::{create_batch, jid, retry_if_blob_missing, sole_blob, target_query_get};
+use super::{Maps, Net, Plan, Quarantine, Uploader};
 use crate::error::Error;
 use crate::logging::Logger;
 use crate::sync::import_jmap::mapping::{
@@ -30,6 +30,7 @@ pub fn reconcile(
     maps: &mut Maps,
     counts: &mut TypeCounts,
     logger: &Logger,
+    unrecorded: &mut Vec<String>,
 ) -> Result<Plan, Error> {
     let targets = target_query_get(net, ty, None).map_err(Error::from)?;
     let mut by_uid: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -67,11 +68,15 @@ pub fn reconcile(
 
     let mut matched_uids: HashSet<String> = HashSet::new();
     let mut uploader = Uploader::new(net, &ctx.conn);
+    let mut quarantine = Quarantine::open(&ctx.conn, ty, net.dry_run)?;
     for (local, uid) in &rows {
         if let Some(tid) = by_uid.get(uid) {
             maps.insert(ty, *local, crate::jmap::wire::JmapId(tid.clone()));
             matched_uids.insert(uid.clone());
             counts.skipped += 1;
+            // It is on the target now, so any quarantine row a previous run left
+            // behind describes a failure that has since been resolved.
+            quarantine.resolve(*local, logger);
             continue;
         }
         let cid = format!("c{local}");
@@ -80,19 +85,35 @@ pub fn reconcile(
             Ok(w) => w,
             Err(e) => {
                 logger.warn(&format!("{} local {local} skipped: {e}", ty.jmap_name()));
+                quarantine.record_local_failure(
+                    *local,
+                    &cid,
+                    None,
+                    "buildFailed",
+                    e.to_string(),
+                    logger,
+                );
                 counts.failed += 1;
                 continue;
             }
         };
         let touched = uploader.take_touched();
         let outcome = create_batch(net, ty, vec![(cid.clone(), wire)]).map_err(Error::from)?;
-        let outcome =
-            match retry_if_blob_missing(net, ty, &cid, &mut uploader, touched, outcome, |up| {
+        let (outcome, retry) =
+            match retry_if_blob_missing(net, ty, &cid, &mut uploader, &touched, outcome, |up| {
                 build_wire(ctx, ty, *local, maps, up)
             }) {
                 Ok(o) => o,
                 Err(e) => {
                     logger.warn(&format!("{} local {local} skipped: {e}", ty.jmap_name()));
+                    quarantine.record_local_failure(
+                        *local,
+                        &cid,
+                        sole_blob(&touched),
+                        "buildFailed",
+                        format!("rebuilding after blobNotFound: {e}"),
+                        logger,
+                    );
                     counts.failed += 1;
                     continue;
                 }
@@ -103,10 +124,25 @@ pub fn reconcile(
             {
                 maps.insert(ty, parsed, crate::jmap::wire::JmapId(id));
                 counts.created += 1;
+                quarantine.resolve(parsed, logger);
             }
         }
         for (cid, err) in &outcome.not_created {
-            logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()));
+            match cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok()) {
+                Some(parsed) => quarantine.record_refusal(
+                    net,
+                    parsed,
+                    cid,
+                    sole_blob(&touched),
+                    Some(err),
+                    retry.as_ref(),
+                    logger,
+                ),
+                // The target answered with a creation id we never sent, so there
+                // is no archive object to key a quarantine row on. Report it as
+                // it stands rather than filing it against a guessed-at id.
+                None => logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name())),
+            }
             counts.failed += 1;
         }
     }
@@ -125,6 +161,12 @@ pub fn reconcile(
             })
         })
         .collect();
+    // Not `?`: the pass above completed and its counters are sound, so a failure
+    // to write the sidecar rows travels as its own signal rather than as an error
+    // that `run()` would charge to `failed`. See `Quarantine::finish`.
+    if let Some(e) = quarantine.finish() {
+        unrecorded.push(e);
+    }
     Ok(Plan {
         prune_candidates: candidates(&objs, false),
         active_sieve_target: None,

@@ -281,14 +281,16 @@ Stateless re-export of `ARCHIVE` into a target JMAP server account. The default 
 ### Inspect
 
 ```
-vandelay inspect <ARCHIVE> [TYPE] [--limit <N>] [--offset <N>]
+vandelay inspect <ARCHIVE> [TYPE] [--failures|--failed-items] [--json] [--limit <N>] [--offset <N>]
 ```
 
-Read-only dump of a local archive. This command never opens a network connection and never writes to the archive.
+Read-only dump of a local archive. This command never opens a network connection and never modifies archive contents (it does apply the schema on open, so an older archive gains any table added since it was written).
 
-- Omit `TYPE` for a per-type summary (counts of every object kind plus blob storage stats).
+- Omit `TYPE` for a per-type summary (counts of every object kind, blob storage stats, and the number of unresolved export failures).
 - Pass an object type to dump it: `mailbox`, `email`, `identity`, `sievescript`, `addressbook`, `contactcard`, `calendar`, `calendarevent`, `participantidentity`, `filenode`.
 - `mailbox` and `filenode` render as a tree (`--limit`/`--offset` are ignored); all other types use a paginated list and respect `--limit` and `--offset`.
+- `--failures` dumps the per-item export quarantine instead of an object type (the two cannot be combined). `export` writes one row per object the target refused, for every object type it exports and not just mail — archive-local id, creation id, size and full blake3 of the object's blob where it has one, message-id for a message, the blobId the target returned, its error type and detail, and the blob-retrievability verdict — so the items behind a `failed=N` summary can be identified without scraping warnings off stderr. (The `failed` counters also cover two things that are not per-item and so have no row: a type whose whole pass aborted, and a `--prune` destroy that the target rejected.) A row is replaced on the next attempt and removed once the item reaches the target, so what remains is exactly the unresolved set. An export also drops rows whose object is no longer in the archive at all — a re-import renumbers local ids, and a row naming a dead one describes an item nothing can identify any more — so a re-imported archive does not leave phantom failures behind. The archive is opened with an exclusive lock, so read it between runs rather than during one. `--failed-items` is an alias of `--failures`.
+- `--json` renders that dump as a single JSON object for a control plane instead of the columnar text an operator reads: `{"failed_items":[{"type":"Email","id":"e499","message_id":"<a@example.com>","size":73932,"content_hash":"…","blob_id":"ebn0","error":"blobNotFound","detail":"BlobId ebn0 not found.","blob_probe":"orphaned_marker","failed_at":"…"}],"omitted":[]}`. `type`, `id` and `error` are present and non-empty on every row; a field the archive has no value for is left out rather than emitted empty, so a reader never stores "" as if it were a recorded fact. `failed_items` is always present and always an array — an archive with nothing quarantined emits `{"failed_items":[],"omitted":[]}` and exits 0, never the human "(no export failures in archive)" notice and never an empty body, because a caller has to be able to tell "nothing failed" apart from "this binary does not implement the dump". `type` is the JMAP type name of an object that names a single transferable item. A refusal that is not one — a mailbox, an address book, a calendar, a file node — is withheld from `failed_items` and counted in `omitted` with its archive token and the reason, since it is already visible in the run's `failed=N` line and has no per-item identity a consumer could act on. `--json` requires the failure dump and is rejected on its own.
 
 ## Testing
 

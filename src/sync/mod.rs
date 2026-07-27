@@ -86,6 +86,16 @@ pub struct Summary {
     pub per_type: Vec<(&'static str, TypeCounts)>,
     pub retries_observed: u64,
     pub retry_after_sleeps: u64,
+    /// Per-item failure records the run could not write into the archive, one
+    /// entry per affected type.
+    ///
+    /// Deliberately kept out of `TypeCounts::failed`: that counter means
+    /// "objects the target refused", and a consumer reconciles it against the
+    /// rows export leaves behind, so charging a bookkeeping error to it would
+    /// add a unit that corresponds to no item and cannot be attributed. It is
+    /// still a non-zero-exit condition — with a record missing, what the
+    /// per-type counters claim is no longer backed by the archive.
+    pub unrecorded_failures: Vec<String>,
 }
 
 impl Summary {
