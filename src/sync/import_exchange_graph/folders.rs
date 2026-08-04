@@ -157,7 +157,7 @@ pub fn reconcile_calendars(
 ) -> Result<Vec<CalendarFolder>, Error> {
     let server = api::collect_all_values(ctx.client, &ctx.endpoints.calendars(ctx.top), &[])
         .map_err(Error::from)?;
-    let mailbox_tz = Some(mailbox_timezone(ctx)?);
+    let mailbox_tz = mailbox_timezone(ctx)?;
     let local: HashMap<String, i64> =
         exchange_graph_ids::ids_of_type(conn, ctx.source_id, exchange_graph_ids::CALENDAR)?;
     let mut out: Vec<CalendarFolder> = Vec::new();
@@ -348,27 +348,40 @@ pub fn reconcile_address_books(
     Ok(out)
 }
 
-fn mailbox_timezone(ctx: &GraphCoordinator<'_>) -> Result<String, Error> {
+fn mailbox_timezone(ctx: &GraphCoordinator<'_>) -> Result<Option<String>, Error> {
     let url = ctx.endpoints.mailbox_settings_timezone();
     let value = ctx.client.get_json(&url).map_err(Error::from)?;
     mailbox_timezone_value(&value)
 }
 
-fn mailbox_timezone_value(value: &Value) -> Result<String, Error> {
-    let tz = value
+/// The mailbox time zone is a DEFAULT for the calendars imported from this
+/// mailbox, and Graph does not guarantee one: a resource mailbox (room,
+/// equipment) commonly reports `mailboxSettings` with no `timeZone` at all.
+/// Absence is therefore ordinary and yields `None` — the calendars import with
+/// no time-zone default, which is exactly what the column already models. It is
+/// not a reason to abandon the mailbox: this used to return `Error::Partial`,
+/// which aborted the whole run (mail included) with exit code 5 for every
+/// resource mailbox.
+///
+/// A time zone that IS present but unparseable still fails: that is a real
+/// mismatch between Graph and the IANA table, and silently dropping it would
+/// import events against the wrong wall-clock.
+fn mailbox_timezone_value(value: &Value) -> Result<Option<String>, Error> {
+    let Some(tz) = value
         .get("timeZone")
         .and_then(Value::as_str)
         .filter(|tz| !tz.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    windows_or_iana_to_iana(tz)
         .ok_or_else(|| {
-            Error::Partial(
-                "malformed: mailboxSettings response has no non-empty string timeZone".to_owned(),
-            )
-        })?;
-    windows_or_iana_to_iana(tz).ok_or_else(|| {
-        Error::Partial(format!(
-            "malformed: mailboxSettings returned unsupported timeZone {tz:?}"
-        ))
-    })
+            Error::Partial(format!(
+                "malformed: mailboxSettings returned unsupported timeZone {tz:?}"
+            ))
+        })
+        .map(Some)
 }
 
 fn resolve_well_known_roles(ctx: &GraphCoordinator<'_>) -> HashMap<String, &'static str> {
@@ -579,18 +592,38 @@ mod tests {
     }
 
     #[test]
-    fn mailbox_timezone_rejects_missing_or_non_string_values() {
-        for value in [json!({}), json!({"timeZone": null}), json!({"timeZone": 7})] {
-            let err = mailbox_timezone_value(&value).expect_err("malformed timeZone must fail");
-            assert!(
-                err.to_string().contains("no non-empty string timeZone"),
-                "got {err}"
+    fn mailbox_timezone_absent_is_no_default_not_a_failure() {
+        // A resource mailbox (room/equipment) reports mailboxSettings with no
+        // timeZone. That must import the mailbox with no calendar time-zone
+        // default, NOT abort the run — which is what failing here used to do.
+        for value in [
+            json!({}),
+            json!({"timeZone": null}),
+            json!({"timeZone": 7}),
+            json!({"timeZone": ""}),
+            json!({"timeZone": "   "}),
+        ] {
+            assert_eq!(
+                mailbox_timezone_value(&value).expect("absent timeZone must not fail"),
+                None,
+                "value {value} should yield no default"
             );
         }
     }
 
     #[test]
+    fn mailbox_timezone_maps_a_present_zone() {
+        assert_eq!(
+            mailbox_timezone_value(&json!({"timeZone": "FLE Standard Time"}))
+                .expect("a known zone must map"),
+            Some("Europe/Kiev".to_owned())
+        );
+    }
+
+    #[test]
     fn mailbox_timezone_rejects_unknown_names() {
+        // Present-but-unmappable stays fatal: importing events against the wrong
+        // wall-clock is worse than stopping.
         let err = mailbox_timezone_value(&json!({"timeZone": "Made Up Zone"}))
             .expect_err("an unmapped timeZone must fail");
         assert!(
