@@ -318,7 +318,7 @@ fn malformed_response_is_classified_not_retried_forever() {
 }
 
 #[test]
-fn principal_substring_prefilter_rejects_near_matches() {
+fn principal_query_multiple_candidates_is_rejected_as_ambiguous() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let session: Session = serde_json::from_str(&session_json(&base)).unwrap();
@@ -339,8 +339,40 @@ fn principal_substring_prefilter_rejects_near_matches() {
         )
         .create();
 
-    let id = account::resolve(&AccountSelector::Name("alice".into()), &session, &client(1))
-        .expect("resolved");
+    let err =
+        account::resolve(&AccountSelector::Name("alice".into()), &session, &client(1)).unwrap_err();
+    assert_eq!(err.exit_code(), 3);
+    assert!(err.to_string().contains("ambiguous"));
+}
+
+#[test]
+fn principal_query_alias_accepts_primary_name_from_get() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let session: Session = serde_json::from_str(&session_json(&base)).unwrap();
+    server
+        .mock("POST", "/jmap/api")
+        .with_status(200)
+        .with_body(
+            json!({ "methodResponses": [
+                ["Principal/query", { "ids": ["p1"] }, "q"],
+                ["Principal/get", { "list": [
+                    { "id": "p1", "name": "primary@example.org", "accounts": {
+                        "w": { "urn:ietf:params:jmap:principals:owner":
+                               { "accountIdForPrincipal": "w" } } } }
+                ] }, "g"]
+            ] })
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let id = account::resolve(
+        &AccountSelector::Name("alias@example.org".into()),
+        &session,
+        &client(1),
+    )
+    .expect("the query result, not its primary display name, identifies the alias");
     assert_eq!(id, "w");
 }
 

@@ -157,7 +157,7 @@ pub fn reconcile_calendars(
 ) -> Result<Vec<CalendarFolder>, Error> {
     let server = api::collect_all_values(ctx.client, &ctx.endpoints.calendars(ctx.top), &[])
         .map_err(Error::from)?;
-    let mailbox_tz = mailbox_timezone(ctx);
+    let mailbox_tz = Some(mailbox_timezone(ctx)?);
     let local: HashMap<String, i64> =
         exchange_graph_ids::ids_of_type(conn, ctx.source_id, exchange_graph_ids::CALENDAR)?;
     let mut out: Vec<CalendarFolder> = Vec::new();
@@ -178,6 +178,9 @@ pub fn reconcile_calendars(
             let color = value
                 .get("hexColor")
                 .and_then(Value::as_str)
+                // Graph returns an empty hexColor when no explicit RGB colour
+                // was chosen; that is absence, not a valid JMAP colour value.
+                .filter(|color| !color.is_empty())
                 .map(str::to_owned)
                 .or_else(|| {
                     value
@@ -193,8 +196,17 @@ pub fn reconcile_calendars(
             let existing = local.get(graph_id).copied();
             let tz = mailbox_tz.clone();
             let local_id = if let Some(id) = existing {
+                // Graph Calendar directly supplies only the overlapping JMAP
+                // fields name, colour, and default identity. Time zone is the
+                // mailbox preference. The remaining JMAP calendar preferences
+                // have no Graph Calendar equivalent, so reset them to the same
+                // deterministic defaults used on first import instead of
+                // retaining stale values from an older archive/source.
                 tx.execute(
-                    "UPDATE calendars SET name = ?1, color = ?2, is_default = ?3, time_zone = ?4
+                    "UPDATE calendars SET name = ?1, description = NULL, color = ?2,
+                         sort_order = 0, is_subscribed = 1, is_visible = 1, is_default = ?3,
+                         include_in_availability = 'all', default_alerts_with_time = NULL,
+                         default_alerts_without_time = NULL, time_zone = ?4
                      WHERE id = ?5",
                     params![name, color, is_default as i64, tz, id],
                 )?;
@@ -336,11 +348,27 @@ pub fn reconcile_address_books(
     Ok(out)
 }
 
-fn mailbox_timezone(ctx: &GraphCoordinator<'_>) -> Option<String> {
+fn mailbox_timezone(ctx: &GraphCoordinator<'_>) -> Result<String, Error> {
     let url = ctx.endpoints.mailbox_settings_timezone();
-    let value = ctx.client.get_json(&url).ok()?;
-    let tz = value.get("timeZone").and_then(Value::as_str)?;
-    windows_or_iana_to_iana(tz)
+    let value = ctx.client.get_json(&url).map_err(Error::from)?;
+    mailbox_timezone_value(&value)
+}
+
+fn mailbox_timezone_value(value: &Value) -> Result<String, Error> {
+    let tz = value
+        .get("timeZone")
+        .and_then(Value::as_str)
+        .filter(|tz| !tz.trim().is_empty())
+        .ok_or_else(|| {
+            Error::Partial(
+                "malformed: mailboxSettings response has no non-empty string timeZone".to_owned(),
+            )
+        })?;
+    windows_or_iana_to_iana(tz).ok_or_else(|| {
+        Error::Partial(format!(
+            "malformed: mailboxSettings returned unsupported timeZone {tz:?}"
+        ))
+    })
 }
 
 fn resolve_well_known_roles(ctx: &GraphCoordinator<'_>) -> HashMap<String, &'static str> {
@@ -548,5 +576,26 @@ mod tests {
         ];
         let out = order_by_parent(input);
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn mailbox_timezone_rejects_missing_or_non_string_values() {
+        for value in [json!({}), json!({"timeZone": null}), json!({"timeZone": 7})] {
+            let err = mailbox_timezone_value(&value).expect_err("malformed timeZone must fail");
+            assert!(
+                err.to_string().contains("no non-empty string timeZone"),
+                "got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_timezone_rejects_unknown_names() {
+        let err = mailbox_timezone_value(&json!({"timeZone": "Made Up Zone"}))
+            .expect_err("an unmapped timeZone must fail");
+        assert!(
+            err.to_string().contains("unsupported timeZone"),
+            "got {err}"
+        );
     }
 }

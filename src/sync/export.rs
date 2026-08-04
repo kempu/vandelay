@@ -350,6 +350,63 @@ impl<'a> Quarantine<'a> {
         self.record(item, logger);
     }
 
+    /// Record a target refusal for an update of an object that was otherwise
+    /// matched successfully.
+    ///
+    /// Updates have no client creation id, so `u<local-id>` is used as the
+    /// stable operation label and the target id is kept in the detail. Keeping
+    /// this in the same quarantine as create refusals ensures a metadata update
+    /// cannot fail while the aggregate counters claim an unqualified match.
+    #[allow(clippy::too_many_arguments)]
+    fn record_update_refusal(
+        &mut self,
+        net: &Net,
+        local_id: i64,
+        target_id: &str,
+        blob_local_id: Option<i64>,
+        err: Option<&Value>,
+        retry: Option<&BlobRetry>,
+        logger: &Logger,
+    ) {
+        let (error_type, detail) = match err {
+            Some(e) => (
+                e.get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                format!("target {target_id}: {e}"),
+            ),
+            None => (
+                "missingSetResult".to_owned(),
+                format!(
+                    "{}/set returned neither updated nor notUpdated for target {target_id}",
+                    self.ty.jmap_name()
+                ),
+            ),
+        };
+        let cid = format!("u{local_id}");
+        let item = self.row(local_id, &cid, &error_type, detail);
+        let mut item = self.with_blob(item, blob_local_id, logger);
+        if let Some(retry) = retry {
+            item.target_blob_id = Some(retry.second.clone());
+            if item.error_type == "blobNotFound" {
+                let (probe, probe_detail) = classify_blob(net, &retry.second);
+                if let Some(text) = probe_detail {
+                    item.error_detail = format!("{}; blob probe: {text}", item.error_detail);
+                }
+                item.blob_probe = probe;
+            }
+        }
+        logger.warn(&format!(
+            "{} target {target_id} not updated: {}{}{}",
+            self.ty.jmap_name(),
+            item.error_detail,
+            retry.map_or("", |retry| dedup_note(&retry.first, &retry.second)),
+            probe_note(&item.blob_probe),
+        ));
+        self.record(item, logger);
+    }
+
     /// Sweep the rows `resolve()` can never reach, once per run.
     ///
     /// See `db::export_failures::reap_missing` for why a row can end up naming
@@ -737,7 +794,17 @@ fn work_list(
     EXPORT_ORDER
         .into_iter()
         .filter(|ty| selected.map(|s| s.contains(ty)).unwrap_or(true))
-        .filter(|ty| has_rows(conn, *ty))
+        // An explicitly selected prune surface is authoritative even when its
+        // archive table is empty: that is how deleting the source's last item
+        // removes the final target object. Preserve the historical has-rows
+        // guard for an unscoped export so `--prune` alone cannot turn a partial
+        // archive into authority over every empty object type.
+        .filter(|ty| {
+            has_rows(conn, *ty)
+                || (config.prune
+                    && selected.map(|types| types.contains(ty)).unwrap_or(false)
+                    && empty_prune_is_authoritative(*ty))
+        })
         .filter(|ty| {
             if connected.supports(*ty) {
                 true
@@ -750,6 +817,17 @@ fn work_list(
             }
         })
         .collect()
+}
+
+fn empty_prune_is_authoritative(ty: ObjectType) -> bool {
+    matches!(
+        ty,
+        ObjectType::Email
+            | ObjectType::ContactCard
+            | ObjectType::CalendarEvent
+            | ObjectType::SieveScript
+            | ObjectType::FileNode
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -966,9 +1044,36 @@ mod common {
         )
     }
 
+    pub fn update_one(
+        net: &Net,
+        ty: ObjectType,
+        target_id: &str,
+        patch: Value,
+    ) -> Result<crate::jmap::request::SetOutcome, JmapError> {
+        let mut update = Map::new();
+        update.insert(target_id.to_owned(), patch);
+        set_call(
+            &net.client,
+            &net.api,
+            &net.account,
+            ty.jmap_name(),
+            SetRequest {
+                update: Some(Value::Object(update)),
+                ..Default::default()
+            },
+            &net.limits,
+        )
+    }
+
     fn blob_not_found(outcome: &crate::jmap::request::SetOutcome, cid: &str) -> bool {
         outcome.not_created.iter().any(|(c, err)| {
             c == cid && err.get("type").and_then(Value::as_str) == Some("blobNotFound")
+        })
+    }
+
+    fn update_blob_not_found(outcome: &crate::jmap::request::SetOutcome, target_id: &str) -> bool {
+        outcome.not_updated.iter().any(|(id, err)| {
+            id == target_id && err.get("type").and_then(Value::as_str) == Some("blobNotFound")
         })
     }
 
@@ -1023,6 +1128,41 @@ mod common {
             _ => None,
         };
         let outcome = create_batch(net, ty, vec![(cid.to_owned(), wire)]).map_err(Error::from)?;
+        Ok((outcome, retry))
+    }
+
+    /// Update counterpart to `retry_if_blob_missing`.
+    ///
+    /// Matched contacts/events can still introduce newly uploaded blobIds in
+    /// their replacement wire. Give an update the same one-shot cache
+    /// invalidation, re-upload, and orphan-marker evidence as a create.
+    pub fn retry_update_if_blob_missing<F>(
+        net: &Net,
+        ty: ObjectType,
+        target_id: &str,
+        uploader: &mut Uploader<'_>,
+        touched: &[i64],
+        outcome: crate::jmap::request::SetOutcome,
+        mut rebuild_patch: F,
+    ) -> Result<(crate::jmap::request::SetOutcome, Option<BlobRetry>), Error>
+    where
+        F: FnMut(&mut Uploader<'_>) -> Result<Value, Error>,
+    {
+        if !update_blob_not_found(&outcome, target_id) {
+            return Ok((outcome, None));
+        }
+        let first = sole_blob(touched).and_then(|id| uploader.cached(id));
+        for id in touched {
+            uploader.invalidate(*id);
+        }
+        let _ = uploader.take_touched();
+        let patch = rebuild_patch(uploader)?;
+        let _ = uploader.take_touched();
+        let retry = match (first, sole_blob(touched).and_then(|id| uploader.cached(id))) {
+            (Some(first), Some(second)) => Some(BlobRetry { first, second }),
+            _ => None,
+        };
+        let outcome = update_one(net, ty, target_id, patch).map_err(Error::from)?;
         Ok((outcome, retry))
     }
 
@@ -1114,5 +1254,23 @@ mod tests {
         assert_eq!(common::sole_blob(&[7]), Some(7));
         assert_eq!(common::sole_blob(&[]), None);
         assert_eq!(common::sole_blob(&[7, 8]), None);
+    }
+
+    #[test]
+    fn empty_prune_never_claims_native_identity_or_container_surfaces() {
+        for ty in [
+            ObjectType::Identity,
+            ObjectType::ParticipantIdentity,
+            ObjectType::Mailbox,
+            ObjectType::AddressBook,
+            ObjectType::Calendar,
+        ] {
+            assert!(
+                !empty_prune_is_authoritative(ty),
+                "an empty archive cannot own native {} objects",
+                ty.jmap_name()
+            );
+        }
+        assert!(empty_prune_is_authoritative(ObjectType::CalendarEvent));
     }
 }

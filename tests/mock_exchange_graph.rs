@@ -34,6 +34,10 @@ fn url_message_collection(server_url: &str, folder: &str, top: usize) -> String 
     e.folder_messages_meta(folder, top)
 }
 
+fn url_event(event_id: &str) -> String {
+    Endpoints::for_me("").event(event_id)
+}
+
 fn make_jwt(exp: u64, upn: &str) -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
@@ -1058,6 +1062,353 @@ fn make_config(
 }
 
 #[test]
+fn graph_calendar_import_converges_every_archived_jmap_calendar_field() {
+    let mut server = Server::new();
+    server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"uid-meta","userPrincipalName":"alice@x.com"}"#)
+        .expect_at_least(2)
+        .create();
+    server
+        .mock("GET", "/me/mailboxSettings?$select=timeZone")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"timeZone":"Pacific Standard Time"}"#)
+        .expect_at_least(2)
+        .create();
+    server
+        .mock("GET", "/me/calendars?$top=100")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r##"{"value":[{
+                "id":"CAL-META","name":"Graph Primary","hexColor":"#123456",
+                "color":"lightBlue","isDefaultCalendar":true,"canEdit":false,
+                "canShare":false,"canViewPrivateItems":false,"isRemovable":false,
+                "isTallyingResponses":true,"owner":{"name":"Alice","address":"alice@x.com"},
+                "allowedOnlineMeetingProviders":["teamsForBusiness"],
+                "defaultOnlineMeetingProvider":"teamsForBusiness"
+            }]}"##,
+        )
+        .expect_at_least(2)
+        .create();
+    server
+        .mock(
+            "GET",
+            "/me/calendars/CAL-META/events?$top=100&$select=id,type,seriesMasterId",
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .expect_at_least(2)
+        .create();
+
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let base = server.url();
+    let config = || {
+        make_config(
+            base.clone(),
+            None,
+            Some(vec![vandelay::types::ObjectType::Calendar]),
+        )
+    };
+    vandelay::sync::import_exchange_graph::run(make_common(archive.clone()), config())
+        .expect("first calendar import");
+
+    // Seed every Graph-unsupported JMAP preference with stale data. A second
+    // import must return the archive to the deterministic Graph mapping instead
+    // of carrying values that Microsoft Graph cannot substantiate into export.
+    {
+        let conn = vandelay::db::init::open(&archive).unwrap();
+        conn.execute(
+            "UPDATE calendars SET name='stale', description='stale', color='#000000',
+                 sort_order=99, is_subscribed=0, is_visible=0, is_default=0,
+                 include_in_availability='none', default_alerts_with_time=?1,
+                 default_alerts_without_time=?1, time_zone='Europe/Berlin'",
+            rusqlite::params![r#"{"old":{}}"#],
+        )
+        .unwrap();
+    }
+
+    let second = vandelay::sync::import_exchange_graph::run(make_common(archive.clone()), config())
+        .expect("second calendar import");
+    let calendar_counts = second
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "calendar")
+        .map(|(_, counts)| counts)
+        .expect("calendar counts");
+    assert_eq!(calendar_counts.fetched, 1);
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    type CalendarMetadataRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: CalendarMetadataRow = conn
+        .query_row(
+            "SELECT name,description,color,sort_order,is_subscribed,is_visible,is_default,
+                    include_in_availability,default_alerts_with_time,
+                    default_alerts_without_time,time_zone FROM calendars",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row.0, "Graph Primary");
+    assert_eq!(row.1, None, "Graph Calendar has no description field");
+    assert_eq!(row.2.as_deref(), Some("#123456"));
+    assert_eq!(row.3, 0, "Graph Calendar has no sort-order field");
+    assert_eq!(row.4, 1, "enumerated calendars are subscribed");
+    assert_eq!(row.5, 1, "Graph Calendar has no hidden preference");
+    assert_eq!(row.6, 1);
+    assert_eq!(row.7, "all", "Graph exposes no availability preference");
+    assert_eq!(row.8, None, "Graph exposes no calendar-level alert map");
+    assert_eq!(row.9, None, "Graph exposes no calendar-level alert map");
+    assert_eq!(row.10.as_deref(), Some("America/Los_Angeles"));
+}
+
+#[test]
+fn graph_calendar_import_does_not_turn_mailbox_timezone_failure_into_null() {
+    let mut server = Server::new();
+    server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"uid-tz","userPrincipalName":"alice@x.com"}"#)
+        .create();
+    server
+        .mock("GET", "/me/calendars?$top=100")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[{"id":"CAL1","name":"Primary"}]}"#)
+        .create();
+    let timezone = server
+        .mock("GET", "/me/mailboxSettings?$select=timeZone")
+        .with_status(503)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"code":"ServiceUnavailable"}}"#)
+        .expect(1)
+        .create();
+    let no_events = server
+        .mock("GET", Matcher::Regex(r"/calendars/.*/events".to_owned()))
+        .expect(0)
+        .create();
+
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let err = vandelay::sync::import_exchange_graph::run(
+        make_common(archive),
+        make_config(
+            server.url(),
+            None,
+            Some(vec![vandelay::types::ObjectType::Calendar]),
+        ),
+    )
+    .expect_err("a failed timezone read must abort calendar metadata import");
+    assert!(
+        matches!(err, vandelay::error::Error::Connection(_)),
+        "got {err:?}"
+    );
+    timezone.assert();
+    no_events.assert();
+}
+
+#[test]
+fn graph_calendar_event_rerun_refreshes_edits_and_calendar_moves() {
+    let mut server = Server::new();
+    server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"uid-rerun","userPrincipalName":"alice@x.com"}"#)
+        .expect(2)
+        .create();
+    server
+        .mock("GET", "/me/mailboxSettings?$select=timeZone")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"timeZone":"UTC"}"#)
+        .expect(2)
+        .create();
+    server
+        .mock("GET", "/me/calendars?$top=100")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"value":[
+                {"id":"CAL-A","name":"Personal","isDefaultCalendar":true},
+                {"id":"CAL-B","name":"Work","isDefaultCalendar":false}
+            ]}"#,
+        )
+        .expect(2)
+        .create();
+
+    let first_a = server
+        .mock(
+            "GET",
+            "/me/calendars/CAL-A/events?$top=100&$select=id,type,seriesMasterId",
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[{"id":"EV","type":"singleInstance"}]}"#)
+        .expect(1)
+        .create();
+    let first_b = server
+        .mock(
+            "GET",
+            "/me/calendars/CAL-B/events?$top=100&$select=id,type,seriesMasterId",
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .expect(1)
+        .create();
+    let first_event = server
+        .mock("GET", Matcher::Exact(url_event("EV")))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{
+                "id":"EV","iCalUId":"same-uid","type":"singleInstance",
+                "subject":"Before",
+                "start":{"dateTime":"2026-08-04T09:00:00","timeZone":"UTC"},
+                "end":{"dateTime":"2026-08-04T10:00:00","timeZone":"UTC"}
+            }"#,
+        )
+        .expect(1)
+        .create();
+
+    let archive = tempfile::NamedTempFile::new().unwrap().path().to_owned();
+    let graph_base = server.url();
+    let config = || {
+        make_config(
+            graph_base.clone(),
+            None,
+            Some(vec![
+                vandelay::types::ObjectType::Calendar,
+                vandelay::types::ObjectType::CalendarEvent,
+            ]),
+        )
+    };
+    let first = vandelay::sync::import_exchange_graph::run(make_common(archive.clone()), config())
+        .expect("initial Graph calendar import");
+    let first_events = first
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "calendarevent")
+        .map(|(_, counts)| counts)
+        .expect("event counts");
+    assert_eq!(first_events.created, 1);
+    first_a.assert();
+    first_b.assert();
+    first_event.assert();
+    first_a.remove();
+    first_b.remove();
+    first_event.remove();
+
+    let second_a = server
+        .mock(
+            "GET",
+            "/me/calendars/CAL-A/events?$top=100&$select=id,type,seriesMasterId",
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .expect(1)
+        .create();
+    let second_b = server
+        .mock(
+            "GET",
+            "/me/calendars/CAL-B/events?$top=100&$select=id,type,seriesMasterId",
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[{"id":"EV","type":"singleInstance"}]}"#)
+        .expect(1)
+        .create();
+    let second_event = server
+        .mock("GET", Matcher::Exact(url_event("EV")))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{
+                "id":"EV","iCalUId":"same-uid","type":"singleInstance",
+                "subject":"After",
+                "start":{"dateTime":"2026-08-04T11:00:00","timeZone":"UTC"},
+                "end":{"dateTime":"2026-08-04T12:00:00","timeZone":"UTC"}
+            }"#,
+        )
+        .expect(1)
+        .create();
+
+    let second = vandelay::sync::import_exchange_graph::run(make_common(archive.clone()), config())
+        .expect("Graph calendar rerun");
+    second_a.assert();
+    second_b.assert();
+    second_event.assert();
+    let second_events = second
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "calendarevent")
+        .map(|(_, counts)| counts)
+        .expect("event counts");
+    assert_eq!(second_events.created, 0);
+    assert_eq!(second_events.fetched, 1, "the existing event is refreshed");
+    assert_eq!(second_events.deleted, 0);
+    assert_eq!(second_events.failed, 0);
+
+    let conn = vandelay::db::init::open(&archive).unwrap();
+    let work_id: i64 = conn
+        .query_row("SELECT id FROM calendars WHERE name = 'Work'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let (calendar_ids, data): (String, String) = conn
+        .query_row(
+            "SELECT calendar_ids, data FROM calendar_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&calendar_ids).unwrap(),
+        json!([work_id]),
+        "the existing row moves to the source calendar"
+    );
+    let data: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(data["title"], "After");
+    assert_eq!(data["start"], "2026-08-04T11:00:00");
+    let event_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM calendar_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(event_rows, 1, "the rerun updates rather than duplicates");
+}
+
+#[test]
 fn users_upn_routes_through_users_segment_not_me() {
     let mut server = Server::new();
     let _resolve = server
@@ -1175,7 +1526,7 @@ fn series_master_with_exception_merges_into_recurrence_overrides() {
         )
         .create();
     server
-        .mock("GET", "/me/events/MASTER")
+        .mock("GET", Matcher::Exact(url_event("MASTER")))
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(
@@ -1194,7 +1545,7 @@ fn series_master_with_exception_merges_into_recurrence_overrides() {
         )
         .create();
     server
-        .mock("GET", "/me/events/EX")
+        .mock("GET", Matcher::Exact(url_event("EX")))
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(
@@ -1297,7 +1648,7 @@ fn occurrence_event_is_skipped_no_row_no_id_mapping() {
         )
         .create();
     let occ_get = server
-        .mock("GET", "/me/events/OCC")
+        .mock("GET", Matcher::Exact(url_event("OCC")))
         .with_status(500)
         .with_body("MUST NOT BE CALLED")
         .expect(0)
@@ -1652,7 +2003,7 @@ fn event_get_carries_outlook_timezone_and_body_content_type_prefer() {
         .expect(1)
         .create();
     let _event_get = server
-        .mock("GET", "/me/events/EVT")
+        .mock("GET", Matcher::Exact(url_event("EVT")))
         .match_header(
             "prefer",
             Matcher::AllOf(vec![

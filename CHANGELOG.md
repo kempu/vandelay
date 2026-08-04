@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
-## [1.0.7-mp.4] - 2026-07-26
+## [1.0.7-mp.4] - 2026-08-04
 
 MailPortal patched build (fork `kempu/vandelay`). Carries the mp.1–mp.3 patches below plus
 structured per-item export failures. The binary still reports version `1.0.7`; the patched
@@ -88,6 +88,17 @@ build is distinguished by its tag/artifact (`-mp.4`) and checksum.
   without the failure dump rather than ignored (`inspect/failures.rs`, `inspect/mod.rs`, `cli.rs`).
 
 ### Fixed
+- exchange-graph/calendar export: preserve the source calendar set instead of leaving
+  Stalwart's native default beside a second imported default (Patch 7). The source default now
+  reuses the target's existing default calendar regardless of name, converges all mutable
+  Calendar metadata, and maps every event to that reused id. Full reruns refresh changed or moved
+  Graph events, update UID-matched target events (including `calendarIds` and cleared optional
+  fields), match duplicate UIDs one-to-one, and let an explicitly pruned reconciliation remove
+  obsolete duplicate calendars/events even when the corresponding archive table is empty.
+  Graph calendar metadata is refreshed deterministically on rerun; mailbox timezone failures or
+  unmapped names now fail the import instead of silently dropping metadata
+  (`sync/import_exchange_graph/{folders,calendar}.rs`, `sync/export/{flat,uidtype}.rs`,
+  `sync/export.rs`).
 - import: `gc_orphan_blobs` reaped the bytes of a quarantined item. The GC runs at the end of every
   import and deletes any blob not referenced by `emails`/`sieve_scripts`/`file_nodes`/the `@blob`
   JSON sentinels; a message the target refused is frequently down to its last copy, so the next

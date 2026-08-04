@@ -56,7 +56,11 @@ pub fn reconcile_all(
                 _ => {
                     if let Some(id) = stub.get("id").and_then(Value::as_str) {
                         server_total.insert(id.to_owned());
-                        if !local.contains_key(id) && planned.insert(id.to_owned()) {
+                        // A full Graph import is a reconciliation pass, not an
+                        // append-only snapshot. Re-fetch known ids as well so
+                        // source edits and moves between calendars replace the
+                        // archived event on every clean rerun.
+                        if planned.insert(id.to_owned()) {
                             want_ids.push(id.to_owned());
                         }
                     }
@@ -65,7 +69,7 @@ pub fn reconcile_all(
         }
         if ctx.logger.enabled(LEVEL_PROGRESS) {
             eprintln!(
-                "graph calendar {} events: stubs={} new={} occurrences_skipped={}",
+                "graph calendar {} events: stubs={} fetch={} occurrences_skipped={}",
                 cal.graph_id,
                 stubs.len(),
                 want_ids.len(),
@@ -122,7 +126,7 @@ pub fn reconcile_all(
         }
 
         let pairs: Vec<(String, ConvertedEvent)> = master_by_graph_id.into_iter().collect();
-        insert_events_chunked(conn, ctx, cal.local_id, &pairs, counts)?;
+        upsert_events_chunked(conn, ctx, cal.local_id, &pairs, &local, counts)?;
     }
 
     if any_failure {
@@ -315,33 +319,66 @@ fn strip_offset_and_fractional(raw: &str) -> String {
     }
 }
 
-fn insert_events_chunked(
+fn upsert_events_chunked(
     conn: &mut Connection,
     ctx: &GraphCoordinator<'_>,
     calendar_local_id: i64,
     pairs: &[(String, ConvertedEvent)],
+    local: &HashMap<String, i64>,
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
     for chunk in pairs.chunks(CHUNK_SIZE) {
         let tx = conn.unchecked_transaction()?;
         for (graph_id, event) in chunk {
-            insert_event_in_tx(&tx, ctx, calendar_local_id, graph_id, event, counts)?;
+            upsert_event_in_tx(
+                &tx,
+                ctx,
+                calendar_local_id,
+                graph_id,
+                event,
+                local.get(graph_id).copied(),
+                counts,
+            )?;
         }
         tx.commit()?;
     }
     Ok(())
 }
 
-fn insert_event_in_tx(
+fn upsert_event_in_tx(
     tx: &Transaction<'_>,
     ctx: &GraphCoordinator<'_>,
     calendar_local_id: i64,
     graph_id: &str,
     event: &ConvertedEvent,
+    existing_local_id: Option<i64>,
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
     let calendar_ids = json!([calendar_local_id]).to_string();
     let data = event.data.to_string();
+    if let Some(local_id) = existing_local_id {
+        let updated = tx.execute(
+            "UPDATE calendar_events
+             SET calendar_ids = ?1, is_draft = ?2, use_default_alerts = ?3,
+                 data = ?4, data_type = 'Event'
+             WHERE id = ?5",
+            params![
+                calendar_ids,
+                event.is_draft as i64,
+                event.use_default_alerts as i64,
+                data,
+                local_id,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(Error::Partial(format!(
+                "Graph event {graph_id} maps to missing local calendar event {local_id}"
+            )));
+        }
+        counts.fetched += 1;
+        return Ok(());
+    }
+
     tx.execute(
         "INSERT INTO calendar_events (calendar_ids, is_draft, use_default_alerts, data, data_type)
          VALUES (?1, ?2, ?3, ?4, 'Event')",

@@ -16,6 +16,17 @@ pub const PREFER_TIMEZONE_UTC: &str = "outlook.timezone=\"UTC\"";
 pub const PREFER_BODY_TEXT: &str = "outlook.body-content-type=\"text\"";
 pub const PREFER_BODY_HTML: &str = "outlook.body-content-type=\"html\"";
 
+// `cancelledOccurrences` is not part of Graph's default Event response; it is
+// returned only when explicitly selected.  Keep the complete mapped property
+// set here so selecting it cannot accidentally turn every other field into an
+// omission during a full event fetch.
+const EVENT_SELECT: &str = concat!(
+    "id,iCalUId,type,seriesMasterId,originalStart,isDraft,subject,body,start,end,",
+    "isAllDay,originalStartTimeZone,isCancelled,sensitivity,importance,showAs,",
+    "categories,locations,recurrence,organizer,attendees,createdDateTime,",
+    "lastModifiedDateTime,isReminderOn,reminderMinutesBeforeStart,cancelledOccurrences"
+);
+
 #[derive(Debug, Clone)]
 pub struct Endpoints {
     pub api_base: String,
@@ -107,7 +118,11 @@ impl Endpoints {
     }
 
     pub fn event(&self, event_id: &str) -> String {
-        format!("{}/events/{}", self.me_or_user(), url_escape(event_id))
+        format!(
+            "{}/events/{}?$select={EVENT_SELECT}",
+            self.me_or_user(),
+            url_escape(event_id)
+        )
     }
 
     pub fn contact_folders(&self, top: usize) -> String {
@@ -332,6 +347,17 @@ mod tests {
     }
 
     #[test]
+    fn full_event_endpoint_explicitly_requests_cancelled_occurrences() {
+        let e = Endpoints::for_me(DEFAULT_API_BASE);
+        let url = e.event("MASTER");
+        assert!(url.contains("$select="));
+        assert!(url.contains("cancelledOccurrences"));
+        assert!(url.contains("subject"));
+        assert!(url.contains("start"));
+        assert!(url.contains("recurrence"));
+    }
+
+    #[test]
     fn folder_messages_meta_selects_read_and_flag() {
         let e = Endpoints::for_me(DEFAULT_API_BASE);
         let url = e.folder_messages_meta("F", 100);
@@ -371,11 +397,11 @@ mod tests {
                 Some((id.to_owned(), MessageMeta { is_read, flagged }))
             })
             .collect();
-        assert_eq!(metas[0].1.is_read, true);
-        assert_eq!(metas[0].1.flagged, true);
-        assert_eq!(metas[1].1.is_read, false);
-        assert_eq!(metas[1].1.flagged, false);
-        assert_eq!(metas[2].1.is_read, false);
-        assert_eq!(metas[2].1.flagged, false);
+        assert!(metas[0].1.is_read);
+        assert!(metas[0].1.flagged);
+        assert!(!metas[1].1.is_read);
+        assert!(!metas[1].1.flagged);
+        assert!(!metas[2].1.is_read);
+        assert!(!metas[2].1.flagged);
     }
 }

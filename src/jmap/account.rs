@@ -89,15 +89,12 @@ fn resolve_via_principal(
         .and_then(Value::as_array)
         .ok_or_else(|| Error::Account("Principal/get returned no list".to_owned()))?;
 
-    let mut matches: Vec<&Value> = list
-        .iter()
-        .filter(|p| {
-            p.get("name")
-                .and_then(Value::as_str)
-                .map(|n| n == name)
-                .unwrap_or(false)
-        })
-        .collect();
+    // Principal/query already selected these ids using the requested name. Do
+    // not compare Principal/get's `name` again: Stalwart accepts an account
+    // alias in the query but returns that principal's primary name in the get.
+    // Cardinality remains fail-closed so a broad or broken query can never pick
+    // an arbitrary account.
+    let mut matches: Vec<&Value> = list.iter().collect();
 
     match matches.len() {
         0 => Err(Error::Account(format!(
@@ -211,24 +208,6 @@ mod tests {
             .unwrap(),
             "w"
         );
-    }
-
-    #[test]
-    fn substring_near_match_is_rejected_exactly() {
-        let list = json!([
-            { "id": "p1", "name": "alice2", "accounts": {} },
-            { "id": "p2", "name": "alice", "accounts": {
-                "w": { "urn:ietf:params:jmap:principals:owner":
-                       { "accountIdForPrincipal": "w" } } } }
-        ]);
-        let matches: Vec<&Value> = list
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|p| p.get("name").and_then(Value::as_str) == Some("alice"))
-            .collect();
-        assert_eq!(matches.len(), 1);
-        assert_eq!(extract_account_id(matches[0], "alice").unwrap(), "w");
     }
 
     #[test]

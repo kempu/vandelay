@@ -315,14 +315,26 @@ pub fn convert_event(
         card.insert("alerts".to_owned(), Value::Object(alerts));
     }
 
-    if let Some(cancels) = graph_event
-        .get("cancelledOccurrences")
-        .and_then(Value::as_array)
-        && !cancels.is_empty()
+    if let Some(cancels) = graph_event.get("cancelledOccurrences")
+        && !cancels.is_null()
     {
+        let cancels = cancels.as_array().ok_or_else(|| {
+            GraphError::Malformed("event.cancelledOccurrences is not an array".to_owned())
+        })?;
         let mut overrides = Map::new();
-        for entry in cancels.iter().filter_map(Value::as_str) {
-            overrides.insert(entry.to_owned(), json!({"excluded": true}));
+        for entry in cancels {
+            let occurrence_id = entry.as_str().ok_or_else(|| {
+                GraphError::Malformed(
+                    "event.cancelledOccurrences contains a non-string value".to_owned(),
+                )
+            })?;
+            let key = cancelled_occurrence_key(
+                graph_event,
+                occurrence_id,
+                is_all_day,
+                fallback_calendar_tz,
+            )?;
+            overrides.insert(key, json!({"excluded": true}));
         }
         if !overrides.is_empty() {
             card.insert("recurrenceOverrides".to_owned(), Value::Object(overrides));
@@ -338,6 +350,153 @@ pub fn convert_event(
         event_type,
         original_start,
     })
+}
+
+/// Convert Graph's opaque occurrence identifier into the LocalDateTime key
+/// required by JSCalendar's `recurrenceOverrides` map.
+///
+/// Graph documents the identifier as
+/// `OID.{seriesMasterId}.{occurrence-start-date}`.  The date is expressed in
+/// the recurrence range's time zone, while the occurrence's wall-clock time is
+/// inherited from the series master.  Copying the opaque identifier verbatim
+/// produces a key calcard (and therefore Stalwart) silently ignores, reviving a
+/// cancelled instance.  Reject every shape we cannot prove instead.
+fn cancelled_occurrence_key(
+    graph_event: &Value,
+    occurrence_id: &str,
+    is_all_day: bool,
+    fallback_calendar_tz: Option<&str>,
+) -> Result<String, GraphError> {
+    if classify_event_type(graph_event) != EventType::SeriesMaster {
+        return Err(GraphError::Malformed(
+            "cancelledOccurrences is present on a non-series-master event".to_owned(),
+        ));
+    }
+
+    let master_id = graph_event
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            GraphError::Malformed(
+                "series master with cancelledOccurrences has no non-empty id".to_owned(),
+            )
+        })?;
+    let encoded = occurrence_id.strip_prefix("OID.").ok_or_else(|| {
+        GraphError::Malformed(format!(
+            "cancelled occurrence id {occurrence_id:?} does not start with OID."
+        ))
+    })?;
+    let (encoded_master, raw_date) = encoded.rsplit_once('.').ok_or_else(|| {
+        GraphError::Malformed(format!(
+            "cancelled occurrence id {occurrence_id:?} has no start-date suffix"
+        ))
+    })?;
+    if encoded_master != master_id {
+        return Err(GraphError::Malformed(format!(
+            "cancelled occurrence id {occurrence_id:?} belongs to series {encoded_master:?}, not {master_id:?}"
+        )));
+    }
+
+    let date = chrono::NaiveDate::parse_from_str(raw_date, "%Y-%m-%d").map_err(|_| {
+        GraphError::Malformed(format!(
+            "cancelled occurrence id {occurrence_id:?} has invalid start date {raw_date:?}"
+        ))
+    })?;
+    let time = if is_all_day {
+        chrono::NaiveTime::MIN
+    } else {
+        master_recurrence_local_time(graph_event, fallback_calendar_tz)?
+    };
+
+    Ok(date.and_time(time).format("%Y-%m-%dT%H:%M:%S").to_string())
+}
+
+/// Resolve the series master's wall-clock time in the recurrence range zone.
+/// The Graph import asks for UTC event timestamps, but this also honours the
+/// `start.timeZone` value if Graph returns another zone.
+fn master_recurrence_local_time(
+    graph_event: &Value,
+    fallback_calendar_tz: Option<&str>,
+) -> Result<chrono::NaiveTime, GraphError> {
+    use chrono::{DateTime, NaiveDateTime, TimeZone};
+    use chrono_tz::Tz;
+
+    let recurrence_tz_name = graph_event
+        .get("recurrence")
+        .and_then(|r| r.get("range"))
+        .and_then(|r| r.get("recurrenceTimeZone"))
+        .and_then(Value::as_str)
+        .and_then(windows_or_iana_to_iana)
+        .or_else(|| {
+            graph_event
+                .get("originalStartTimeZone")
+                .and_then(Value::as_str)
+                .and_then(windows_or_iana_to_iana)
+        })
+        .or_else(|| {
+            graph_event
+                .get("start")
+                .and_then(|s| s.get("timeZone"))
+                .and_then(Value::as_str)
+                .and_then(windows_or_iana_to_iana)
+        })
+        .or_else(|| fallback_calendar_tz.and_then(windows_or_iana_to_iana))
+        .ok_or_else(|| {
+            GraphError::Malformed(
+                "series master with cancelledOccurrences has no supported recurrence time zone"
+                    .to_owned(),
+            )
+        })?;
+    let recurrence_tz: Tz = recurrence_tz_name.parse().map_err(|_| {
+        GraphError::Malformed(format!(
+            "series master recurrence time zone {recurrence_tz_name:?} is not IANA"
+        ))
+    })?;
+
+    let start = graph_event
+        .get("start")
+        .and_then(|s| s.get("dateTime"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            GraphError::Malformed(
+                "series master with cancelledOccurrences has no start.dateTime".to_owned(),
+            )
+        })?;
+
+    let local = if let Ok(with_offset) = DateTime::parse_from_rfc3339(start) {
+        with_offset.with_timezone(&recurrence_tz).naive_local()
+    } else {
+        let naive = NaiveDateTime::parse_from_str(start, "%Y-%m-%dT%H:%M:%S%.f").map_err(|_| {
+            GraphError::Malformed(format!(
+                "series master start.dateTime {start:?} is not an ISO local date-time"
+            ))
+        })?;
+        let source_tz_name = graph_event
+            .get("start")
+            .and_then(|s| s.get("timeZone"))
+            .and_then(Value::as_str)
+            .and_then(windows_or_iana_to_iana)
+            .unwrap_or_else(|| recurrence_tz_name.clone());
+        let source_tz: Tz = source_tz_name.parse().map_err(|_| {
+            GraphError::Malformed(format!(
+                "series master start time zone {source_tz_name:?} is not IANA"
+            ))
+        })?;
+        source_tz
+            .from_local_datetime(&naive)
+            .single()
+            .ok_or_else(|| {
+                GraphError::Malformed(format!(
+                    "series master start.dateTime {start:?} is ambiguous or nonexistent in {source_tz_name}"
+                ))
+            })?
+            .with_timezone(&recurrence_tz)
+            .naive_local()
+    };
+
+    Ok(local.time())
 }
 
 fn extract_local_datetime(slot: Option<&Value>) -> Option<String> {
@@ -782,6 +941,90 @@ mod tests {
         assert!(rule.is_object());
         assert_eq!(rule["@type"], "RecurrenceRule");
         assert_eq!(rule["frequency"], "daily");
+    }
+
+    #[test]
+    fn cancelled_occurrence_id_becomes_a_local_datetime_override_key() {
+        let mut v = sample();
+        v["type"] = Value::from("seriesMaster");
+        v["recurrence"] = json!({
+            "pattern": {"type": "daily", "interval": 1},
+            "range": {
+                "type": "noEnd",
+                "startDate": "2025-01-15",
+                "recurrenceTimeZone": "Romance Standard Time"
+            }
+        });
+        v["originalStartTimeZone"] = Value::from("Romance Standard Time");
+        v["start"] = json!({"dateTime": "2025-01-15T08:30:00.0000000", "timeZone": "UTC"});
+        v["end"] = json!({"dateTime": "2025-01-15T09:00:00.0000000", "timeZone": "UTC"});
+        v["cancelledOccurrences"] = json!(["OID.AAA.2025-07-15"]);
+
+        let conv = convert_event(&v, None).expect("valid cancelled occurrence");
+        let overrides = conv.data["recurrenceOverrides"].as_object().unwrap();
+        assert_eq!(
+            overrides.get("2025-07-15T09:30:00"),
+            Some(&json!({"excluded": true})),
+            "the cancellation keeps the master's 09:30 recurrence wall time across DST"
+        );
+        assert!(
+            !overrides.contains_key("OID.AAA.2025-07-15"),
+            "Graph's opaque occurrenceId is not a valid JSCalendar key"
+        );
+    }
+
+    #[test]
+    fn cancelled_occurrence_survives_the_same_calcard_roundtrip_as_stalwart() {
+        use calcard::jscalendar::JSCalendar;
+
+        let mut v = sample();
+        v["type"] = Value::from("seriesMaster");
+        v["recurrence"] = json!({
+            "pattern": {"type": "daily", "interval": 1},
+            "range": {
+                "type": "numbered",
+                "startDate": "2026-05-27",
+                "numberOfOccurrences": 4,
+                "recurrenceTimeZone": "UTC"
+            }
+        });
+        v["cancelledOccurrences"] = json!(["OID.AAA.2026-05-29"]);
+
+        let conv = convert_event(&v, None).expect("convert Graph series");
+        // Stalwart applies CalendarEvent/set properties to a JSCalendar Group,
+        // then converts that group through calcard before storing iCalendar.
+        let encoded = json!({"@type": "Group", "entries": [conv.data]}).to_string();
+        let js = JSCalendar::<String, String>::parse(&encoded).expect("parse JSCalendar");
+        let ical = js.into_icalendar().expect("Stalwart calcard conversion");
+        let wire = ical.to_string();
+        assert!(wire.contains("EXDATE"), "{wire}");
+        assert!(wire.contains("20260529T100000"), "{wire}");
+
+        let roundtrip = ical.into_jscalendar::<String, String>();
+        let roundtrip: Value =
+            serde_json::from_str(&roundtrip.to_string_pretty()).expect("round-trip JSON");
+        assert_eq!(
+            roundtrip["entries"][0]["recurrenceOverrides"]["2026-05-29T10:00:00"]["excluded"], true,
+            "{roundtrip:#}"
+        );
+    }
+
+    #[test]
+    fn malformed_cancelled_occurrence_fails_closed() {
+        let mut v = sample();
+        v["type"] = Value::from("seriesMaster");
+        v["recurrence"] = json!({
+            "pattern": {"type": "daily", "interval": 1},
+            "range": {
+                "type": "noEnd",
+                "startDate": "2026-05-27",
+                "recurrenceTimeZone": "UTC"
+            }
+        });
+        v["cancelledOccurrences"] = json!(["OID.OTHER.not-a-date"]);
+
+        let err = convert_event(&v, None).expect_err("bad cancellation must reject master");
+        assert!(matches!(err, GraphError::Malformed(_)));
     }
 
     #[test]

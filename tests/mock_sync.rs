@@ -1718,13 +1718,45 @@ fn export_calendar_creates_only_missing() {
         .with_body(session_body_full(&base))
         .expect_at_least(1)
         .create();
+    let _calendar_term = anchor_terminator(&mut server, api, "Calendar");
+    let _calendar_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/query",{
+                "accountId":"w","ids":["F"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
     let _g = server
         .mock("POST", api)
-        .match_body(Matcher::Regex("Calendar/get".into()))
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Calendar/get".into()),
+            Matcher::Regex("defaultAlertsWithoutTime".into()),
+        ]))
         .with_body(
             json!({"methodResponses":[["Calendar/get",{"accountId":"w","list":[
-                {"id":"F","name":"family","isDefault":true,"myRights":{"mayDelete":false}}
+                {"id":"F","name":"family","description":null,"color":null,
+                 "sortOrder":0,"isSubscribed":true,"isVisible":true,"isDefault":true,
+                 "includeInAvailability":"all","defaultAlertsWithTime":{},
+                 "defaultAlertsWithoutTime":{},"timeZone":null,
+                 "myRights":{"mayDelete":false}}
             ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let update = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Calendar/set".into()),
+            Matcher::Regex(r#"\"update\":\{\"F\""#.into()),
+            Matcher::Regex(r#"\"name\":\"Family\""#.into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Calendar/set",{"accountId":"w",
+                "updated":{"F":null}},"s"]]})
             .to_string(),
         )
         .expect(1)
@@ -1748,6 +1780,7 @@ fn export_calendar_creates_only_missing() {
         export_cfg_objects(&base, vec![ObjectType::Calendar]),
     )
     .expect("export");
+    update.assert();
     create.assert();
     let counts = summary
         .per_type
@@ -1755,9 +1788,1158 @@ fn export_calendar_creates_only_missing() {
         .find(|(t, _)| *t == "Calendar")
         .map(|(_, c)| c.clone())
         .expect("calendar counts");
-    assert_eq!(counts.skipped, 1, "Family matches existing (case-fold)");
+    assert_eq!(counts.updated, 1, "Family metadata casing converges");
+    assert_eq!(counts.skipped, 0);
     assert_eq!(counts.created, 1, "Team is created");
     assert_eq!(counts.failed, 0);
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_matched_calendar_clears_nullable_metadata_and_alerts() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id,name,is_default) VALUES (1,'Personal',0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _calendar_term = anchor_terminator(&mut server, api, "Calendar");
+    let _calendar_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/query",{
+                "accountId":"w","ids":["P"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _calendar_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/get",{"accountId":"w","list":[{
+                "id":"P","name":"Personal","description":"stale","color":"#000000",
+                "sortOrder":0,"isSubscribed":true,"isVisible":true,"isDefault":false,
+                "includeInAvailability":"all","defaultAlertsWithTime":{"old":{}},
+                "defaultAlertsWithoutTime":{"old":{}},"timeZone":"Europe/Berlin",
+                "myRights":{"mayDelete":true}
+            }],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let update = server
+        .mock("POST", api)
+        .match_body(Matcher::PartialJson(json!({
+            "methodCalls": [["Calendar/set", {
+                "update": {"P": {
+                    "name": "Personal",
+                    "description": null,
+                    "color": null,
+                    "defaultAlertsWithTime": {},
+                    "defaultAlertsWithoutTime": {},
+                    "timeZone": null
+                }}
+            }, "s"]]
+        })))
+        .with_body(
+            json!({"methodResponses":[["Calendar/set",{"accountId":"w",
+                "updated":{"P":null}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Calendar]),
+    )
+    .expect("export");
+    update.assert();
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "Calendar")
+        .map(|(_, counts)| counts)
+        .expect("calendar counts");
+    assert_eq!(counts.updated, 1);
+    assert_eq!(counts.created, 0);
+    assert_eq!(counts.failed, 0);
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_calendar_without_declared_source_default_reuses_native_default() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO calendars
+                (id,name,description,color,sort_order,is_subscribed,is_visible,is_default,
+                 include_in_availability,default_alerts_with_time,
+                 default_alerts_without_time,time_zone)
+             VALUES (7,'Imported Calendar','Source description','#123456',9,1,0,0,
+                     'attending',NULL,NULL,'Europe/Tallinn')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _calendar_term = anchor_terminator(&mut server, api, "Calendar");
+    let _calendar_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/query",{
+                "accountId":"w","ids":["TD"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let calendar_get = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Calendar/get".into()),
+            Matcher::Regex("defaultAlertsWithTime".into()),
+            Matcher::Regex("defaultAlertsWithoutTime".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Calendar/get",{"accountId":"w","list":[{
+                "id":"TD","name":"Calendar","description":null,"color":null,
+                "sortOrder":0,"isSubscribed":true,"isVisible":true,"isDefault":true,
+                "includeInAvailability":"all","defaultAlertsWithTime":{},
+                "defaultAlertsWithoutTime":{},"timeZone":null,
+                "myRights":{"mayDelete":false}
+            }],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let update = server
+        .mock("POST", api)
+        .match_body(Matcher::PartialJson(json!({
+            "methodCalls": [["Calendar/set", {
+                "accountId": "w",
+                "update": {"TD": {
+                    "name": "Imported Calendar",
+                    "description": "Source description",
+                    "color": "#123456",
+                    "sortOrder": 9,
+                    "isSubscribed": true,
+                    "isVisible": false,
+                    "includeInAvailability": "attending",
+                    "defaultAlertsWithTime": {},
+                    "defaultAlertsWithoutTime": {},
+                    "timeZone": "Europe/Tallinn"
+                }}
+            }, "s"]]
+        })))
+        .with_body(
+            json!({"methodResponses":[["Calendar/set",{"accountId":"w",
+                "updated":{"TD":null}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let no_create = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Calendar/set".into()),
+            Matcher::Regex(r#""create""#.into()),
+        ]))
+        .expect(0)
+        .create();
+    let no_default_change = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("onSuccessSetIsDefault".into()))
+        .expect(0)
+        .create();
+    let no_destroy = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Calendar/set".into()),
+            Matcher::Regex(r#""destroy""#.into()),
+        ]))
+        .expect(0)
+        .create();
+
+    let mut config = export_cfg_objects(&base, vec![ObjectType::Calendar]);
+    config.prune = true;
+    let summary = sync::export::run(common(&archive), config).expect("export");
+
+    calendar_get.assert();
+    update.assert();
+    no_create.assert();
+    no_default_change.assert();
+    no_destroy.assert();
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "Calendar")
+        .map(|(_, counts)| counts)
+        .expect("calendar counts");
+    assert_eq!(counts.created, 0, "the native default must be reused");
+    assert_eq!(counts.updated, 1);
+    assert_eq!(counts.deleted, 0);
+    assert_eq!(counts.failed, 0);
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_calendar_with_multiple_source_defaults_fails_before_writing_target() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id,name,is_default) VALUES
+                (1,'First',1),
+                (2,'Second',1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _calendar_term = anchor_terminator(&mut server, api, "Calendar");
+    let _calendar_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/query",{
+                "accountId":"w","ids":["TD"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let calendar_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/get",{"accountId":"w","list":[{
+                "id":"TD","name":"Calendar","description":null,"color":null,
+                "sortOrder":0,"isSubscribed":true,"isVisible":true,"isDefault":true,
+                "includeInAvailability":"all","defaultAlertsWithTime":{},
+                "defaultAlertsWithoutTime":{},"timeZone":null,
+                "myRights":{"mayDelete":false}
+            }],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let no_write = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/set".into()))
+        .expect(0)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Calendar]),
+    )
+    .expect("the run reports the invalid surface instead of mutating it");
+
+    calendar_get.assert();
+    no_write.assert();
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "Calendar")
+        .map(|(_, counts)| counts)
+        .expect("calendar counts");
+    assert_eq!(counts.created, 0);
+    assert_eq!(counts.updated, 0);
+    assert_eq!(counts.deleted, 0);
+    assert_eq!(counts.failed, 1, "ambiguous defaults must fail closed");
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_default_calendar_reuses_target_default_updates_metadata_and_prunes_duplicate() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    let alerts = json!({
+        "reminder": {
+            "@type": "Alert",
+            "trigger": {
+                "@type": "OffsetTrigger",
+                "offset": "-PT15M",
+                "relativeTo": "start"
+            },
+            "action": "display"
+        }
+    });
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO calendars
+                (id,name,description,color,sort_order,is_subscribed,is_visible,is_default,
+                 include_in_availability,default_alerts_with_time,
+                 default_alerts_without_time,time_zone)
+             VALUES (1,'Imported Primary','Source description','#123456',42,0,0,1,
+                     'attending',?1,NULL,NULL)",
+            rusqlite::params![alerts.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendar_events (id,calendar_ids,data)
+             VALUES (10,'[1]',?1)",
+            rusqlite::params![
+                json!({
+                    "@type": "Event",
+                    "uid": "source-default-event",
+                    "title": "Preserved event"
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _calendar_term = anchor_terminator(&mut server, api, "Calendar");
+    let _calendar_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/query",{
+                "accountId":"w","ids":["TD","DUP"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let calendars = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Calendar/get".into()),
+            Matcher::Regex("defaultAlertsWithTime".into()),
+            Matcher::Regex("defaultAlertsWithoutTime".into()),
+            Matcher::Regex("includeInAvailability".into()),
+            Matcher::Regex("isVisible".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Calendar/get",{"accountId":"w","list":[
+                {
+                    "id":"TD","name":"Calendar","description":"stale",
+                    "color":"#000000","sortOrder":1,"isSubscribed":true,
+                    "isVisible":true,"isDefault":true,"includeInAvailability":"none",
+                    "defaultAlertsWithTime":{"old":{}},
+                    "defaultAlertsWithoutTime":{"old":{}},"timeZone":"Europe/Berlin",
+                    "myRights":{"mayDelete":false}
+                },
+                {
+                    "id":"DUP","name":"Imported Primary","isDefault":false,
+                    "myRights":{"mayDelete":true}
+                }
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let update = server
+        .mock("POST", api)
+        .match_body(Matcher::PartialJson(json!({
+            "methodCalls": [["Calendar/set", {
+                "accountId": "w",
+                "update": {"TD": {
+                    "name": "Imported Primary",
+                    "description": "Source description",
+                    "color": "#123456",
+                    "sortOrder": 42,
+                    "isSubscribed": false,
+                    "isVisible": false,
+                    "includeInAvailability": "attending",
+                    "defaultAlertsWithTime": alerts.clone(),
+                    "defaultAlertsWithoutTime": {},
+                    "timeZone": null
+                }}
+            }, "s"]]
+        })))
+        .with_body(
+            json!({"methodResponses":[["Calendar/set",{"accountId":"w",
+                "updated":{"TD":null}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let no_create = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Calendar/set".into()),
+            Matcher::Regex(r#""create":"#.into()),
+        ]))
+        .expect(0)
+        .create();
+    let no_is_default_property = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Calendar/set".into()),
+            Matcher::Regex(r#""isDefault""#.into()),
+        ]))
+        .expect(0)
+        .create();
+    let _event_term = anchor_terminator(&mut server, api, "CalendarEvent");
+    let event_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("CalendarEvent/query".into()))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/query",{
+                "accountId":"w","ids":["EV","EV-DUP"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let event_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("CalendarEvent/get".into()))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/get",{"accountId":"w","list":[{
+                "id":"EV","@type":"Event","uid":"source-default-event",
+                "title":"Preserved event","calendarIds":{"DUP":true},
+                "description":"stale","alerts":{"old":{}},
+                "isDraft":false,"useDefaultAlerts":false,
+                "baseEventId":"BASE","isOrigin":true,
+                "utcStart":"2026-08-04T09:00:00Z",
+                "utcEnd":"2026-08-04T10:00:00Z","blobId":"DERIVED"
+            },{
+                "id":"EV-DUP","@type":"Event","uid":"source-default-event",
+                "title":"Duplicate event","calendarIds":{"DUP":true},
+                "isDraft":false,"useDefaultAlerts":false
+            }],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(2)
+        .create();
+    let event_update = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("CalendarEvent/set".into()),
+            Matcher::Regex(r#""calendarIds":\{"TD":true\}"#.into()),
+            Matcher::Regex(r#""description":null"#.into()),
+            Matcher::Regex(r#""alerts":null"#.into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/set",{"accountId":"w",
+                "updated":{"EV":null}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let no_server_owned_event_patch = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("CalendarEvent/set".into()),
+            Matcher::Regex(r#""(baseEventId|isOrigin|utcStart|utcEnd|blobId)""#.into()),
+        ]))
+        .expect(0)
+        .create();
+    let no_event_create = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("CalendarEvent/set".into()),
+            Matcher::Regex(r#""create""#.into()),
+        ]))
+        .expect(0)
+        .create();
+    let destroy_duplicate_event = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("CalendarEvent/set".into()),
+            Matcher::Regex(r#""destroy":\["EV-DUP"\]"#.into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/set",{"accountId":"w",
+                "destroyed":["EV-DUP"]},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let destroy_duplicate = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Calendar/set".into()),
+            Matcher::Regex(r#""destroy":\["DUP"\]"#.into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Calendar/set",{"accountId":"w",
+                "destroyed":["DUP"]},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let mut config =
+        export_cfg_objects(&base, vec![ObjectType::Calendar, ObjectType::CalendarEvent]);
+    config.prune = true;
+    let summary = sync::export::run(common(&archive), config).expect("export");
+
+    calendars.assert();
+    update.assert();
+    no_create.assert();
+    no_is_default_property.assert();
+    event_query.assert();
+    event_get.assert();
+    event_update.assert();
+    no_server_owned_event_patch.assert();
+    no_event_create.assert();
+    destroy_duplicate_event.assert();
+    destroy_duplicate.assert();
+    let calendar = summary
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "Calendar")
+        .map(|(_, counts)| counts)
+        .expect("calendar counts");
+    assert_eq!(calendar.created, 0, "the target default is reused");
+    assert_eq!(calendar.updated, 1, "all source metadata is applied");
+    assert_eq!(calendar.deleted, 1, "same-name duplicate is pruned");
+    assert_eq!(calendar.failed, 0);
+    let events = summary
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "CalendarEvent")
+        .map(|(_, counts)| counts)
+        .expect("calendar event counts");
+    assert_eq!(events.created, 0);
+    assert_eq!(
+        events.updated, 1,
+        "existing source content is moved from the duplicate to the reused default id"
+    );
+    assert_eq!(events.deleted, 1, "the unmatched duplicate UID is pruned");
+    assert_eq!(events.failed, 0);
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_calendar_metadata_not_updated_is_counted_and_quarantined() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id,name,is_default) VALUES (1,'Imported Primary',1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _calendar_term = anchor_terminator(&mut server, api, "Calendar");
+    let _calendar_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/query",{
+                "accountId":"w","ids":["TD"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _calendar_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/get",{"accountId":"w","list":[{
+                "id":"TD","name":"Calendar","description":null,"color":null,
+                "sortOrder":0,"isSubscribed":true,"isVisible":true,"isDefault":true,
+                "includeInAvailability":"all","defaultAlertsWithTime":{},
+                "defaultAlertsWithoutTime":{},"timeZone":null,
+                "myRights":{"mayDelete":false}
+            }],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let refuse = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Calendar/set".into()),
+            Matcher::Regex(r#""update":\{"TD""#.into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Calendar/set",{"accountId":"w",
+                "notUpdated":{"TD":{"type":"forbidden",
+                    "description":"calendar preferences are read-only"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Calendar]),
+    )
+    .expect("export");
+    refuse.assert();
+
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "Calendar")
+        .map(|(_, counts)| counts)
+        .expect("calendar counts");
+    assert_eq!(counts.failed, 1);
+    assert_eq!(counts.created, 0);
+    assert_eq!(counts.updated, 0);
+    let rows = failures_in(&archive);
+    assert_eq!(rows.len(), 1, "the failed update must be attributable");
+    assert_eq!(rows[0].type_name, "calendar");
+    assert_eq!(rows[0].local_id, 1);
+    assert_eq!(rows[0].client_id, "u1");
+    assert_eq!(rows[0].error_type, "forbidden");
+    assert!(rows[0].error_detail.contains("read-only"));
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_calendar_event_update_refusal_is_counted_and_quarantined() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id,name,is_default) VALUES (1,'Personal',0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendar_events (id,calendar_ids,data)
+             VALUES (10,'[1]',?1)",
+            rusqlite::params![
+                json!({"@type":"Event","uid":"event-refusal","title":"Source"}).to_string()
+            ],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _calendar_term = anchor_terminator(&mut server, api, "Calendar");
+    let _calendar_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/query",{
+                "accountId":"w","ids":["C"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _calendar_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/get",{"accountId":"w","list":[{
+                "id":"C","name":"Personal","description":null,"color":null,
+                "sortOrder":0,"isSubscribed":true,"isVisible":true,"isDefault":false,
+                "includeInAvailability":"all","defaultAlertsWithTime":{},
+                "defaultAlertsWithoutTime":{},"timeZone":null,
+                "myRights":{"mayDelete":true}
+            }],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _event_term = anchor_terminator(&mut server, api, "CalendarEvent");
+    let _event_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("CalendarEvent/query".into()))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/query",{
+                "accountId":"w","ids":["EV"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _event_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("CalendarEvent/get".into()))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/get",{"accountId":"w","list":[{
+                "id":"EV","@type":"Event","uid":"event-refusal","title":"Stale",
+                "calendarIds":{"C":true},"isDraft":false,"useDefaultAlerts":false,
+                "mayInviteSelf":false,"mayInviteOthers":false,"hideAttendees":false
+            }],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(2)
+        .create();
+    let refuse = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("CalendarEvent/set".into()),
+            Matcher::Regex(r#""update":\{"EV""#.into()),
+            Matcher::Regex(r#""title":"Source""#.into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/set",{"accountId":"w",
+                "notUpdated":{"EV":{"type":"forbidden",
+                    "description":"event is read-only"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Calendar, ObjectType::CalendarEvent]),
+    )
+    .expect("export");
+    refuse.assert();
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "CalendarEvent")
+        .map(|(_, counts)| counts)
+        .expect("event counts");
+    assert_eq!(counts.failed, 1);
+    assert_eq!(counts.updated, 0);
+    assert_eq!(counts.created, 0);
+    let rows = failures_in(&archive);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].type_name, "calendarevent");
+    assert_eq!(rows[0].local_id, 10);
+    assert_eq!(rows[0].client_id, "u10");
+    assert_eq!(rows[0].error_type, "forbidden");
+    assert!(rows[0].error_detail.contains("event is read-only"));
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_calendar_event_update_blob_not_found_reuploads_and_retries() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id,name,is_default) VALUES (1,'Personal',0)",
+            [],
+        )
+        .unwrap();
+        let blob = db::blobs::intern_blob(&conn, b"event attachment").unwrap();
+        conn.execute(
+            "INSERT INTO calendar_events (id,calendar_ids,data)
+             VALUES (10,'[1]',?1)",
+            rusqlite::params![
+                json!({
+                    "@type":"Event","uid":"event-blob-retry","title":"Source",
+                    "links":{"attachment":{"@type":"Link","@blob":blob}}
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _calendar_term = anchor_terminator(&mut server, api, "Calendar");
+    let _calendar_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/query",{
+                "accountId":"w","ids":["C"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _calendar_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/get",{"accountId":"w","list":[{
+                "id":"C","name":"Personal","description":null,"color":null,
+                "sortOrder":0,"isSubscribed":true,"isVisible":true,"isDefault":false,
+                "includeInAvailability":"all","defaultAlertsWithTime":{},
+                "defaultAlertsWithoutTime":{},"timeZone":null,
+                "myRights":{"mayDelete":true}
+            }],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _event_term = anchor_terminator(&mut server, api, "CalendarEvent");
+    let _event_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("CalendarEvent/query".into()))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/query",{
+                "accountId":"w","ids":["EV"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _event_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("CalendarEvent/get".into()))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/get",{"accountId":"w","list":[{
+                "id":"EV","@type":"Event","uid":"event-blob-retry","title":"Source",
+                "calendarIds":{"C":true},"isDraft":false,"useDefaultAlerts":false
+            }],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(2)
+        .create();
+    let upload_stale = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP1"}).to_string())
+        .expect(1)
+        .create();
+    let upload_fresh = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP2"}).to_string())
+        .expect(1)
+        .create();
+    let stale = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("CalendarEvent/set".into()),
+            Matcher::Regex("UP1".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/set",{"accountId":"w",
+                "notUpdated":{"EV":{"type":"blobNotFound"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let fresh = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("CalendarEvent/set".into()),
+            Matcher::Regex("UP2".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/set",{"accountId":"w",
+                "updated":{"EV":null}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Calendar, ObjectType::CalendarEvent]),
+    )
+    .expect("export");
+    upload_stale.assert();
+    upload_fresh.assert();
+    stale.assert();
+    fresh.assert();
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "CalendarEvent")
+        .map(|(_, counts)| counts)
+        .expect("event counts");
+    assert_eq!(counts.updated, 1);
+    assert_eq!(counts.failed, 0);
+    assert!(failures_in(&archive).is_empty());
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_prune_selected_empty_calendar_event_surface_removes_target_only_events() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    let _ = db::init::open(&archive).unwrap();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _event_term = anchor_terminator(&mut server, api, "CalendarEvent");
+    let _event_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("CalendarEvent/query".into()))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/query",{
+                "accountId":"w","ids":["STALE"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _event_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("CalendarEvent/get".into()))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/get",{"accountId":"w","list":[{
+                "id":"STALE","@type":"Event","uid":"target-only",
+                "calendarIds":{"C":true},"isDraft":false,"useDefaultAlerts":false
+            }],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(2)
+        .create();
+    let destroy = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("CalendarEvent/set".into()),
+            Matcher::Regex(r#""destroy":\["STALE"\]"#.into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["CalendarEvent/set",{"accountId":"w",
+                "destroyed":["STALE"]},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let mut config = export_cfg_objects(&base, vec![ObjectType::CalendarEvent]);
+    config.prune = true;
+    let summary = sync::export::run(common(&archive), config).expect("prune empty surface");
+    destroy.assert();
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "CalendarEvent")
+        .map(|(_, counts)| counts)
+        .expect("event counts");
+    assert_eq!(counts.created, 0);
+    assert_eq!(counts.deleted, 1);
+    assert_eq!(counts.failed, 0);
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_source_default_name_match_is_made_target_default() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id,name,is_default) VALUES (1,'Primary',1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _calendar_term = anchor_terminator(&mut server, api, "Calendar");
+    let _calendar_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/query",{
+                "accountId":"w","ids":["P"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _calendar_get = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/get",{"accountId":"w","list":[{
+                "id":"P","name":"Primary","description":null,"color":null,
+                "sortOrder":0,"isSubscribed":true,"isVisible":true,"isDefault":false,
+                "includeInAvailability":"all","defaultAlertsWithTime":{},
+                "defaultAlertsWithoutTime":{},"timeZone":null,
+                "myRights":{"mayDelete":true}
+            }],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let set_default = server
+        .mock("POST", api)
+        .match_body(Matcher::PartialJson(json!({
+            "methodCalls": [["Calendar/set", {
+                "accountId": "w",
+                "onSuccessSetIsDefault": "P"
+            }, "s"]]
+        })))
+        .with_body(
+            json!({"methodResponses":[["Calendar/set",{
+                "accountId":"w"},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let no_metadata_update = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Calendar/set".into()),
+            Matcher::Regex(r#""update""#.into()),
+        ]))
+        .expect(0)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Calendar]),
+    )
+    .expect("export");
+    set_default.assert();
+    no_metadata_update.assert();
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "Calendar")
+        .map(|(_, counts)| counts)
+        .expect("calendar counts");
+    assert_eq!(counts.updated, 1, "default identity changed");
+    assert_eq!(counts.skipped, 0);
+    assert_eq!(counts.failed, 0);
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_created_default_set_failure_is_counted_and_quarantined() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id,name,is_default) VALUES (1,'Primary',1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _calendar_query = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Calendar/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Calendar/query",{
+                "accountId":"w","ids":[]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let create = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Calendar/set".into()),
+            Matcher::Regex(r#""create":\{"c1""#.into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Calendar/set",{"accountId":"w",
+                "created":{"c1":{"id":"NEW"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let fail_default = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("onSuccessSetIsDefault".into()))
+        .with_body(
+            json!({"methodResponses":[["error",{
+                "type":"forbidden","description":"cannot select the default"
+            },"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Calendar]),
+    )
+    .expect("export");
+    create.assert();
+    fail_default.assert();
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(ty, _)| *ty == "Calendar")
+        .map(|(_, counts)| counts)
+        .expect("calendar counts");
+    assert_eq!(counts.created, 1);
+    assert_eq!(counts.failed, 1, "default-setting failure is not silent");
+    let rows = failures_in(&archive);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].local_id, 1);
+    assert_eq!(rows[0].client_id, "c1");
+    assert_eq!(rows[0].error_type, "defaultSetFailed");
+    assert!(rows[0].error_detail.contains("cannot select the default"));
+
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -4522,15 +5704,15 @@ fn export_calendar_that_will_not_build_is_quarantined_without_aborting_the_surfa
         .with_body(session_body_full(&base))
         .expect_at_least(1)
         .create();
-    let _g = server
+    let _q = server
         .mock("POST", api)
-        .match_body(Matcher::Regex("Calendar/get".into()))
+        .match_body(Matcher::Regex("Calendar/query".into()))
         .with_body(
-            json!({"methodResponses":[["Calendar/get",
-                {"accountId":"w","list":[],"notFound":[]},"g"]]})
+            json!({"methodResponses":[["Calendar/query",
+                {"accountId":"w","ids":[]},"q"]]})
             .to_string(),
         )
-        .expect_at_least(1)
+        .expect(1)
         .create();
     let create = server
         .mock("POST", api)
