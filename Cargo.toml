@@ -33,15 +33,15 @@ time = { version = "=0.3.55", features = ["serde-well-known", "macros"] }
 url= "=2.5.8"
 thiserror  = "=2.0.21"
 ureq = { version = "=3.3.0", default-features = false, features = ["json", "gzip", "rustls-no-provider", "platform-verifier"] }
-clap = { version = "=4.6.4", features = ["derive"] }
-crossbeam-channel = "=0.5.16"
+clap = { version = "=4.6.9", features = ["derive"] }
+crossbeam-channel = "=0.5.17"
 num_cpus = "=1.17.0"
 base64 = "=0.22.1"
 mail-parser = "=0.11.5"
-calcard = "=0.3.7"
-rustls = { version = "=0.23.42", default-features = false, features = ["aws-lc-rs", "std", "tls12", "logging"] }
-rustls-platform-verifier = "=0.7.0"
-regex  = "=1.13.1"
+calcard = "=0.3.14"
+rustls = { version = "=0.23.46", default-features = false, features = ["aws-lc-rs", "std", "tls12", "logging"] }
+rustls-platform-verifier = "=0.7.1"
+regex  = "=1.13.2"
 flate2 = "=1.1.9"
 quick-xml = "=0.41.0"
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
